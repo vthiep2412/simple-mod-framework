@@ -131,7 +131,7 @@ function configureSentryScope(transaction: Span) {
 	// 		scope.setSpan(transaction)
 	// 	})
 }
-
+// meh
 function toHuman(dur: Duration) {
 	const units: (keyof DurationLikeObject)[] = ["years", "months", "days", "hours", "minutes", "seconds", "milliseconds"]
 	const smallestIdx = units.indexOf("seconds")
