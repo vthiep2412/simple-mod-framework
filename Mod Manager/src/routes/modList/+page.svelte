@@ -1,9 +1,10 @@
 <script lang="ts">
 	import { scale, fade } from "svelte/transition"
 	import { flip } from "svelte/animate"
+	import { onMount } from "svelte"
 
 	import json5 from "json5"
-	import { Button, CodeSnippet, InlineNotification, Modal, ProgressBar, Search } from "carbon-components-svelte"
+	import { Button, CodeSnippet, InlineNotification, Modal, ProgressBar, Search, InlineLoading } from "carbon-components-svelte"
 	import AnsiToHTML from "ansi-to-html"
 	import throttle from "lodash/throttle"
 
@@ -33,7 +34,7 @@
 		bg: "#262626"
 	})
 
-	import { getAllMods, getConfig, mergeConfig, getManifestFromModID, modIsFramework, getModFolder, sortMods, validateModFolder } from "$lib/utils"
+	import { getAllMods, getConfig, mergeConfig, getManifestFromModID, modIsFramework, getModFolder, sortMods, validateModFolder, clearModsCache, clearValidationCache, preloadModsCache } from "$lib/utils"
 	import Mod from "$lib/Mod.svelte"
 	import TextInputModal from "$lib/TextInputModal.svelte"
 	import { goto } from "$app/navigation"
@@ -51,24 +52,47 @@
 	import { page } from "$app/stores"
 	import SortableList from "$lib/SortableList.svelte"
 
-	let enabledMods: { value: string }[] = [],
-		disabledMods: { value: string }[] = []
-
+	let enabledMods: { value: string }[] = []
+	let disabledMods: { value: string }[] = []
+	let cacheLoaded = false
 	let deleteModModalOpen = false
 	let deleteModInProgress: string
+	let forceModListsUpdate = Math.random()
 
-	let forceModListsUpdate: number = Math.random()
-
-	$: enabledMods = getConfig().loadOrder.map((a) => {
-		return { value: a, dummy: forceModListsUpdate }
+	onMount(async () => {
+		await preloadModsCache("modList")
+		cacheLoaded = true
 	})
 
-	$: disabledMods = getAllMods()
-		.filter((a) => !getConfig().loadOrder.includes(a))
-		.sort((a, b) => (modIsFramework(a) ? getManifestFromModID(a).name : a).localeCompare(modIsFramework(b) ? getManifestFromModID(b).name : b, undefined, { numeric: true, sensitivity: "base" }))
-		.map((a) => {
+	$: if (cacheLoaded) {
+		if (!getConfig().developerMode) {
+			// If no mods are known
+			if (getConfig().knownMods.length == 0) {
+				// Assume all mods are installed correctly
+				mergeConfig({ knownMods: getAllMods() })
+			}
+
+			for (const mod of getAllMods()) {
+				if (!getConfig().knownMods.includes(mod)) {
+					extractedMods.push(getManifestFromModID(mod).name)
+					displayExtractedModsDialog = true
+
+					mergeConfig({ knownMods: [...getConfig().knownMods, mod] })
+				}
+			}
+		}
+
+		enabledMods = getConfig().loadOrder.map((a) => {
 			return { value: a, dummy: forceModListsUpdate }
 		})
+
+		disabledMods = getAllMods()
+			.filter((a) => !getConfig().loadOrder.includes(a))
+			.sort((a, b) => (modIsFramework(a) ? getManifestFromModID(a).name : a).localeCompare(modIsFramework(b) ? getManifestFromModID(b).name : b, undefined, { numeric: true, sensitivity: "base" }))
+			.map((a) => {
+				return { value: a, dummy: forceModListsUpdate }
+			})
+	}
 
 	let changed = false
 
@@ -109,10 +133,10 @@
 		event.preventDefault()
 		event.stopPropagation()
 		showDropHint = false
-		let modFile: any = event.dataTransfer?.files[0]
-		if (!modFile) return
-		modFilePath = modFile.path
-		addMod()
+		if (event.dataTransfer?.files && event.dataTransfer.files.length > 0) {
+			const paths = Array.from(event.dataTransfer.files).map((f: any) => f.path)
+			stageFiles(paths)
+		}
 	})
 	document.addEventListener("dragover", (event) => {
 		event.preventDefault()
@@ -125,191 +149,349 @@
 		if (event.relatedTarget == null) showDropHint = false
 	})
 
-	let modNameInputModal: TextInputModal
-	let modNameInputModalOpen = false
+	let bulkImportModalOpen = false
+	let stageInProgress = false
+	let currentStagingRunId = 0
+	let stagedMods: Array<{
+		id: string
+		fileName: string
+		filePath: string
+		stageDir: string
+		type: "framework" | "rpkg" | "unknown"
+		status: "valid" | "warning" | "invalid"
+		errors: string[]
+		warnings: string[]
+		mods: Array<{
+			id: string
+			name: string
+			folder: string
+			isFramework: boolean
+			rpkgs?: Array<{ path: string; chunk: string }>
+		}>
+		rpkgNameInput?: string
+	}> = []
 
-	let rpkgModExtractionInProgress = false
-	let frameworkModExtractionInProgress = false
+	function execFileAsync(file: string, args: string[]): Promise<string> {
+		return new Promise((resolve, reject) => {
+			window.child_process.execFile(file, args, (error: any, stdout: any, stderr: any) => {
+				if (error) {
+					reject(error)
+				} else {
+					resolve(stdout)
+				}
+			})
+		})
+	}
 
-	let invalidFrameworkZipModalOpen = false
+	function sanitizeModName(name: string): string {
+		let sanitized = name.replace(/[/\\]/g, "")
+		sanitized = sanitized.replace(/\.\./g, "")
+		sanitized = sanitized.trim()
+		if (!sanitized) {
+			sanitized = "staged_rpkg_mod"
+		}
+		return sanitized
+	}
 
-	let invalidModModalOpen = false
-
-	let invalidFrameworkModModalOpen = false
-	let modValidationError = ""
-
-	let modFilePath = ""
-
-	let rpkgsToInstall: { path: string; chunk: string }[]
-	let rpkgModName: string
-
-	let frameworkModScriptsWarningOpen = false
-	let frameworkModPeacockPluginsWarningOpen = false
-
-	async function addMod() {
-		if (modFilePath.endsWith(".rpkg")) {
-			let chunk = "chunk0"
-			
-			let result = [...modFilePath.matchAll(/(chunk[0-9]*)/g)]
-			if (result.length) {
-				chunk = result[0][1]
+	async function stageFiles(filePaths: string[]) {
+		stageInProgress = true
+		bulkImportModalOpen = true
+		stagedMods = []
+		const runId = ++currentStagingRunId
+		try {
+			try {
+				window.fs.emptyDirSync("./staging")
+			} catch (e) {
+				// staging folder might not exist yet
 			}
 
-			rpkgsToInstall = [{ path: modFilePath, chunk }]
-
-			modNameInputModalOpen = true
-		} else {
-			window.fs.emptyDirSync("./staging")
-
-			window.child_process.execSync(`"..\\Third-Party\\7z.exe" x "${modFilePath}" -aoa -y -o"./staging"`)
-
-			const stagingFileList = window.klaw("./staging", { nodir: true })
-
-			if (window.fs.readdirSync("./staging").every((a) => window.fs.existsSync(window.path.join("./staging", a, "manifest.json")))) {
-				// framework mod
-
-				frameworkModExtractionInProgress = true
-
-				if (window.klaw("./staging", { depthLimit: 0, nodir: true }).length) {
-					frameworkModExtractionInProgress = false
-					invalidFrameworkZipModalOpen = true
+			for (let i = 0; i < filePaths.length; i++) {
+				if (runId !== currentStagingRunId) {
 					return
 				}
+				const filePath = filePaths[i]
+				const fileName = window.path.basename(filePath)
+				const stageDir = window.path.join("./staging", `temp_${i}`)
+				window.fs.ensureDirSync(stageDir)
 
+				let type: "framework" | "rpkg" | "unknown" = "unknown"
+				let status: "valid" | "warning" | "invalid" = "valid"
+				let errors: string[] = []
+				let warnings: string[] = []
+				let mods: any[] = []
+				let rpkgNameInput = ""
+
+				if (filePath.toLowerCase().endsWith(".rpkg")) {
+					type = "rpkg"
+					status = "valid"
+					let chunk = "chunk0"
+					let result = [...filePath.matchAll(/(chunk[0-9]*)/g)]
+					if (result.length) {
+						chunk = result[0][1]
+					}
+					const destChunkDir = window.path.join(stageDir, chunk)
+					window.fs.ensureDirSync(destChunkDir)
+					window.fs.copyFileSync(filePath, window.path.join(destChunkDir, fileName))
+					
+					const cleanName = fileName.replace(/\.rpkg$/i, "")
+					rpkgNameInput = cleanName
+					mods = [{
+						id: cleanName,
+						name: cleanName,
+						folder: stageDir,
+						isFramework: false,
+						rpkgs: [{ path: window.path.join(destChunkDir, fileName), chunk }]
+					}]
+				} else {
 				try {
-					window.fs.readdirSync("./staging").forEach((a) => json5.parse(window.fs.readFileSync(window.path.join("./staging", a, "manifest.json"), "utf8")))
-				} catch {
-					frameworkModExtractionInProgress = false
-					invalidModModalOpen = true
-					return
-				}
-
-				for (const modFolder of window.fs.readdirSync("./staging").map((a) => window.path.join("./staging", a))) {
-					const modValidation = validateModFolder(modFolder)
-					if (!modValidation[0]) {
-						frameworkModExtractionInProgress = false
-						invalidFrameworkModModalOpen = true
-						modValidationError = modValidation[1]
+					await execFileAsync("..\\Third-Party\\7z.exe", ["x", filePath, "-aoa", "-y", `-o${stageDir}`])
+					if (runId !== currentStagingRunId) {
 						return
 					}
-				}
-
-				if (
-					window.fs
-						.readdirSync("./staging")
-						.some(
-							(a) =>
-								json5.parse(window.fs.readFileSync(window.path.join("./staging", a, "manifest.json"), "utf8")).scripts ||
-								json5.parse(window.fs.readFileSync(window.path.join("./staging", a, "manifest.json"), "utf8")).options?.some((b) => b.scripts)
-						)
-				) {
-					frameworkModExtractionInProgress = false
-
-					frameworkModScriptsWarningOpen = true
-				} else {
-					if (
-						window.fs
-							.readdirSync("./staging")
-							.some(
-								(a) =>
-									json5.parse(window.fs.readFileSync(window.path.join("./staging", a, "manifest.json"), "utf8")).peacockPlugins ||
-									json5.parse(window.fs.readFileSync(window.path.join("./staging", a, "manifest.json"), "utf8")).options?.some((b) => b.peacockPlugins)
-							)
-					) {
-						frameworkModExtractionInProgress = false
-
-						frameworkModPeacockPluginsWarningOpen = true
-					} else {
-						window.fs.copySync("./staging", "../Mods")
-
-						mergeConfig({
-							knownMods: [
-								...getConfig().knownMods,
-								json5.parse(window.fs.readFileSync(window.path.join("..", "Mods", window.fs.readdirSync("./staging")[0], "manifest.json"), "utf8")).id
-							]
-						})
-
-						window.fs.removeSync("./staging")
-
-						window.location.href = "/modList"
-
-						frameworkModExtractionInProgress = false
-					}
-				}
-			} else {
-				rpkgsToInstall = []
-
-				if (stagingFileList.some((a) => a.path.endsWith(".rpkg"))) {
-					for (const file of stagingFileList.filter((a) => a.path.endsWith(".rpkg"))) {
-						let chunk = "chunk0"
-
-						let result = [...file.path.matchAll(/(chunk[0-9]*)/g)]
-						if (result.length) {
-							chunk = result[0][1]
+					
+					const rootFiles = window.fs.readdirSync(stageDir)
+					const hasFilesAtRoot = window.klaw(stageDir, { depthLimit: 0, nodir: true }).length > 0
+					const everySubdirHasManifest = rootFiles.length > 0 && rootFiles.every(a => {
+						const fullSubPath = window.path.join(stageDir, a)
+						if (!window.isFile(fullSubPath)) {
+							return window.fs.existsSync(window.path.join(fullSubPath, "manifest.json"))
 						}
+						return false
+					})
 
-						rpkgsToInstall.push({ path: file.path, chunk })
+					if (everySubdirHasManifest && !hasFilesAtRoot) {
+						type = "framework"
+						for (const a of rootFiles) {
+							const modFolder = window.path.join(stageDir, a)
+							let manifest: any
+							try {
+								manifest = json5.parse(window.fs.readFileSync(window.path.join(modFolder, "manifest.json"), "utf8"))
+							} catch (e) {
+								status = "invalid"
+								errors.push(`Invalid manifest.json syntax in folder "${a}"`)
+								continue
+							}
+
+							const modValidation = validateModFolder(modFolder)
+							if (!modValidation[0]) {
+								status = "invalid"
+								errors.push(`Validation failed for "${manifest.name || a}": ${modValidation[1]}`)
+							} else {
+								let modWarning = ""
+								if (manifest.scripts || manifest.options?.some((b: any) => b.scripts)) {
+									modWarning = "Contains custom scripts"
+								}
+								if (manifest.peacockPlugins || manifest.options?.some((b: any) => b.peacockPlugins)) {
+									if (modWarning) modWarning += ", and peacock plugins"
+									else modWarning = "Contains peacock plugins"
+								}
+								if (modWarning) {
+									if (status !== "invalid") {
+										status = "warning"
+									}
+									warnings.push(`${manifest.name || a}: ${modWarning}`)
+								}
+								mods.push({
+									id: manifest.id,
+									name: manifest.name,
+									folder: modFolder,
+									isFramework: true
+								})
+							}
+						}
+					} else {
+						const stagingFileList = window.klaw(stageDir, { nodir: true })
+						const rpkgFiles = stagingFileList.filter(a => a.path.toLowerCase().endsWith(".rpkg"))
+						if (rpkgFiles.length > 0) {
+							type = "rpkg"
+							if (status !== "invalid") {
+								status = "valid"
+							}
+							const cleanName = fileName.replace(/\.(zip|7z|rar)$/i, "")
+							rpkgNameInput = cleanName
+							
+							const rpkgsToInstall: any[] = []
+							for (const file of rpkgFiles) {
+								let chunk = "chunk0"
+								let result = [...file.path.matchAll(/(chunk[0-9]*)/g)]
+								if (result.length) {
+									chunk = result[0][1]
+								}
+								rpkgsToInstall.push({ path: file.path, chunk })
+							}
+							
+							mods = [{
+								id: cleanName,
+								name: cleanName,
+								folder: stageDir,
+								isFramework: false,
+								rpkgs: rpkgsToInstall
+							}]
+						} else {
+							type = "unknown"
+							status = "invalid"
+							errors.push("No manifest.json or .rpkg files found in archive")
+						}
 					}
-				} else {
-					invalidModModalOpen = true
-					return
+				} catch (err: any) {
+					status = "invalid"
+					errors.push(`Extraction/Analysis failed: ${err.message || err}`)
 				}
+			}
 
-				modNameInputModalOpen = true
+			if (runId !== currentStagingRunId) {
+				return
+			}
+			stagedMods.push({
+				id: `staged_${Date.now()}_${i}`,
+				fileName,
+				filePath,
+				stageDir,
+				type,
+				status,
+				errors,
+				warnings,
+				mods,
+				rpkgNameInput
+			})
+			}
+			if (runId !== currentStagingRunId) {
+				return
+			}
+			stagedMods = stagedMods
+		} finally {
+			stageInProgress = false
+		}
+	}
+
+	async function executeBulkImport() {
+		const modsToImport = stagedMods.filter((sm) => sm.status !== "invalid")
+
+		const existingNames: string[] = []
+		for (const staged of modsToImport) {
+			if (staged.type === "framework") {
+				for (const mod of staged.mods) {
+					const destFolder = window.path.join("..", "Mods", window.path.basename(mod.folder))
+					if (window.fs.existsSync(destFolder)) {
+						existingNames.push(window.path.basename(mod.folder))
+					}
+				}
+			} else if (staged.type === "rpkg") {
+				const rawName = staged.rpkgNameInput ? staged.rpkgNameInput.trim() : staged.fileName.replace(/\.[^/.]+$/, "")
+				const modName = sanitizeModName(rawName)
+				const destFolder = window.path.join("..", "Mods", modName)
+				if (window.fs.existsSync(destFolder)) {
+					existingNames.push(modName)
+				}
 			}
 		}
+
+		if (existingNames.length > 0) {
+			const confirm = window.confirm(`The following mods already exist and will be overwritten:\n${existingNames.join(", ")}\n\nDo you want to continue?`)
+			if (!confirm) {
+				return
+			}
+		}
+
+		for (const staged of modsToImport) {
+			if (staged.type === "framework") {
+				for (const mod of staged.mods) {
+					const destFolder = window.path.join("..", "Mods", window.path.basename(mod.folder))
+					window.fs.copySync(mod.folder, destFolder)
+
+					if (!getConfig().knownMods.includes(mod.id)) {
+						mergeConfig({
+							knownMods: [...getConfig().knownMods, mod.id]
+						})
+					}
+				}
+			} else if (staged.type === "rpkg") {
+				const rawName = staged.rpkgNameInput ? staged.rpkgNameInput.trim() : staged.fileName.replace(/\.[^/.]+$/, "")
+				const modName = sanitizeModName(rawName)
+				
+				for (const mod of staged.mods) {
+					if (mod.rpkgs) {
+						for (const file of mod.rpkgs) {
+							const destDir = window.path.join("..", "Mods", modName, file.chunk)
+							window.fs.ensureDirSync(destDir)
+							window.fs.copyFileSync(file.path, window.path.join(destDir, window.path.basename(file.path)))
+						}
+					}
+				}
+
+				if (!getConfig().knownMods.includes(modName)) {
+					mergeConfig({
+						knownMods: [...getConfig().knownMods, modName]
+					})
+				}
+			}
+		}
+
+		try {
+			window.fs.removeSync("./staging")
+		} catch (e) {
+			// ignore cleanup errors
+		}
+		
+		clearModsCache()
+		clearValidationCache()
+		
+		forceModListsUpdate = Math.random()
+		changed = true
+
+		bulkImportModalOpen = false
+		stagedMods = []
+	}
+
+	function removeStagedMod(id: string) {
+		const modToRemove = stagedMods.find((sm) => sm.id === id)
+		if (modToRemove) {
+			try {
+				window.fs.removeSync(modToRemove.stageDir)
+			} catch (e) {
+				// ignore cleanup errors
+			}
+		}
+		stagedMods = stagedMods.filter((sm) => sm.id !== id)
+		if (stagedMods.length === 0) {
+			bulkImportModalOpen = false
+		}
+	}
+
+	function cancelBulkImport() {
+		currentStagingRunId++
+		for (const staged of stagedMods) {
+			try {
+				window.fs.removeSync(staged.stageDir)
+			} catch (e) {
+				// ignore cleanup errors
+			}
+		}
+		try {
+			window.fs.removeSync("./staging")
+		} catch (e) {
+			// ignore cleanup errors
+		}
+		stagedMods = []
+		bulkImportModalOpen = false
 	}
 
 	function openAddModDialog() {
 		window.ipc.send("modFileOpenDialog")
 
 		window.ipc.receive("modFileOpenDialogResult", (modFilePopupResult: string[] | undefined) => {
-			if (!modFilePopupResult) {
+			if (!modFilePopupResult || modFilePopupResult.length === 0) {
 				return
 			}
 
-			modFilePath = modFilePopupResult[0]
-
-			addMod()
+			stageFiles(modFilePopupResult)
 		})
-	}
-
-	async function installRPKGMod() {
-		rpkgModExtractionInProgress = true
-
-		for (const file of rpkgsToInstall) {
-			window.fs.ensureDirSync(window.path.join("..", "Mods", rpkgModName, file.chunk))
-			window.fs.copyFileSync(file.path, window.path.join("..", "Mods", rpkgModName, file.chunk, window.path.basename(file.path)))
-		}
-
-		mergeConfig({ knownMods: [...getConfig().knownMods, rpkgModName] })
-
-		window.fs.removeSync("./staging")
-
-		window.location.reload()
-
-		rpkgModExtractionInProgress = false
 	}
 
 	let displayExtractedModsDialog = false
 	const extractedMods: string[] = []
 
-	if (!getConfig().developerMode) {
-		// If no mods are known
-		if (getConfig().knownMods.length == 0) {
-			// Assume all mods are installed correctly
-			mergeConfig({ knownMods: getAllMods() })
-		}
-
-		for (const mod of getAllMods()) {
-			if (!getConfig().knownMods.includes(mod)) {
-				extractedMods.push(getManifestFromModID(mod).name)
-				displayExtractedModsDialog = true
-
-				mergeConfig({ knownMods: [...getConfig().knownMods, mod] })
-			}
-		}
-	}
+	// Config verification moved to reactive cacheLoaded block to prevent synchronous loading blocks on render
 
 	let uploadedLogURL = ""
 	let uploadLogModalOpen = false
@@ -373,8 +555,21 @@
 			autoInstallModalOpen = true
 		})()
 	}
+
+	function handleSort(event: any) {
+		mergeConfig({
+			loadOrder: event.detail.map((a: any) => a.value)
+		})
+		forceModListsUpdate = Math.random()
+		changed = true
+	}
 </script>
 
+{#if !cacheLoaded}
+	<div class="flex flex-col items-center justify-center h-full w-full gap-4">
+		<InlineLoading description="Loading mods cache..." />
+	</div>
+{:else}
 <div class="grid grid-cols-2 gap-4 w-full mb-16">
 	<div class="w-full">
 		<div class="flex gap-4 items-center justify-center" transition:scale>
@@ -463,13 +658,7 @@
 			<SortableList
 				list={enabledMods}
 				key="value"
-				on:sort={(event) => {
-					mergeConfig({
-						loadOrder: event.detail.map((a) => a.value)
-					})
-					forceModListsUpdate = Math.random()
-					changed = true
-				}}
+				on:sort={handleSort}
 				let:item
 			>
 				<div class="cursor-grab">
@@ -529,8 +718,11 @@
 		window.fs.removeSync(getModFolder(deleteModInProgress))
 		mergeConfig({ knownMods: getConfig().knownMods.filter((a) => a != deleteModInProgress) })
 
+		clearModsCache()
+		clearValidationCache()
+		forceModListsUpdate = Math.random()
+		changed = true
 		deleteModModalOpen = false
-		window.location.reload()
 	}}
 	shouldSubmitOnEnter={false}
 >
@@ -618,105 +810,100 @@
 	{/if}
 </Modal>
 
-<TextInputModal
-	bind:this={modNameInputModal}
-	bind:showingModal={modNameInputModalOpen}
-	modalText="Mod name"
-	modalPlaceholder="Amazing RPKG Mod"
-	on:close={() => {
-		modNameInputModalOpen = false
-
-		rpkgModName = modNameInputModal.value
-
-		if (!rpkgModName.match(/^(?!(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.[^.]*)?$)[^<>:"\/\\|?*\x00-\x1F]*[^<>:"\/\\|?*\x00-\x1F .]$/iu)) {
-			window.alert("That's not a valid folder name and so cannot be used for an RPKG mod name. Please try another.")
-			setTimeout(() => (modNameInputModalOpen = true), 100)
-		} else {
-			installRPKGMod()
-		}
-	}}
-/>
-
-<Modal passiveModal open={rpkgModExtractionInProgress} modalHeading="Installing {rpkgModName}" preventCloseOnClickOutside>The mod is being installed - please wait.</Modal>
-
-<Modal passiveModal open={frameworkModExtractionInProgress} modalHeading="Installing the mod" preventCloseOnClickOutside>The mod is being installed - please wait.</Modal>
-
-<Modal alert bind:open={invalidFrameworkZipModalOpen} modalHeading="Invalid framework ZIP" primaryButtonText="OK" shouldSubmitOnEnter={false} on:submit={() => (invalidFrameworkZipModalOpen = false)}>
-	<p>The framework ZIP file contains files in the root directory. Contact the mod author.</p>
-</Modal>
-
-<Modal alert bind:open={invalidModModalOpen} modalHeading="Not a mod" primaryButtonText="OK" shouldSubmitOnEnter={false} on:submit={() => (invalidModModalOpen = false)}>
-	<p>This doesn't look like a mod? Make sure you select a mod ZIP, and that the mod is either a framework mod or RPKG mod.</p>
-</Modal>
-
-<Modal alert bind:open={invalidFrameworkModModalOpen} modalHeading="Invalid mod" primaryButtonText="OK" shouldSubmitOnEnter={false} on:submit={() => (invalidFrameworkModModalOpen = false)}>
-	<p>The mod you're trying to install is invalid. Contact the mod author.</p>
-	<span class="mt-1 text-xs text-neutral-300">{modValidationError}</span>
-</Modal>
-
 <Modal
-	danger
-	bind:open={frameworkModScriptsWarningOpen}
-	modalHeading="Mod contains scripts"
-	primaryButtonText="I'm sure"
+	open={bulkImportModalOpen}
+	modalHeading="Staged Mods for Import"
+	primaryButtonText="Import Valid Mods"
 	secondaryButtonText="Cancel"
-	shouldSubmitOnEnter={false}
-	on:click:button--secondary={() => (frameworkModScriptsWarningOpen = false)}
-	on:click:button--primary={() => {
-		if (
-			window.fs
-				.readdirSync("./staging")
-				.some(
-					(a) =>
-						json5.parse(window.fs.readFileSync(window.path.join("./staging", a, "manifest.json"), "utf8")).peacockPlugins ||
-						json5.parse(window.fs.readFileSync(window.path.join("./staging", a, "manifest.json"), "utf8")).options?.some((b) => b.peacockPlugins)
-				)
-		) {
-			frameworkModScriptsWarningOpen = false
-
-			frameworkModPeacockPluginsWarningOpen = true
-		} else {
-			window.fs.copySync("./staging", "../Mods")
-
-			mergeConfig({
-				knownMods: [...getConfig().knownMods, json5.parse(window.fs.readFileSync(window.path.join("..", "Mods", window.fs.readdirSync("./staging")[0], "manifest.json"), "utf8")).id]
-			})
-
-			window.fs.removeSync("./staging")
-
-			window.location.href = "/modList"
-		}
-	}}
+	primaryButtonDisabled={stagedMods.filter(sm => sm.status !== "invalid").length === 0}
+	on:click:button--primary={executeBulkImport}
+	on:click:button--secondary={cancelBulkImport}
+	on:close={cancelBulkImport}
 >
-	<p>
-		This mod contains scripts; that means it is able to execute its own (external to the framework) code and effectively has complete control over your PC whenever you apply your mods. Scripts can
-		do cool things and make a lot of mods possible, but they can also do bad things like installing malware on your computer. Make sure you trust whoever developed this mod, and wherever you
-		downloaded it from. Are you sure you want to add this mod?
-	</p>
-</Modal>
+	<div class="mt-4 max-h-[50vh] overflow-y-auto overflow-x-hidden pr-2">
+		{#if stageInProgress}
+			<div class="flex flex-col items-center justify-center py-8">
+				<ProgressBar helperText="Analyzing and staging mods..." />
+			</div>
+		{:else}
+			<div class="flex flex-col gap-4">
+				{#each stagedMods as item (item.id)}
+					<div class="flex flex-col gap-2 rounded bg-neutral-800 p-4 border border-neutral-700">
+						<div class="flex items-center justify-between gap-4">
+							<div class="flex flex-col min-w-0">
+								<span class="font-bold text-white truncate text-[1rem]">{item.fileName}</span>
+								<span class="text-xs text-neutral-400 truncate">{item.filePath}</span>
+							</div>
+							<div class="flex items-center gap-2 flex-shrink-0">
+								{#if item.type === "framework"}
+									<span class="px-2 py-0.5 rounded text-xs font-semibold bg-blue-900 text-blue-200">Framework Mod</span>
+								{:else if item.type === "rpkg"}
+									<span class="px-2 py-0.5 rounded text-xs font-semibold bg-purple-900 text-purple-200">RPKG Mod</span>
+								{:else}
+									<span class="px-2 py-0.5 rounded text-xs font-semibold bg-neutral-700 text-neutral-300">Unknown</span>
+								{/if}
 
-<Modal
-	danger
-	bind:open={frameworkModPeacockPluginsWarningOpen}
-	modalHeading="Mod contains Peacock plugins"
-	primaryButtonText="I'm sure"
-	secondaryButtonText="Cancel"
-	shouldSubmitOnEnter={false}
-	on:click:button--secondary={() => (frameworkModPeacockPluginsWarningOpen = false)}
-	on:click:button--primary={() => {
-		window.fs.copySync("./staging", "../Mods")
+								{#if item.status === "valid"}
+									<span class="px-2 py-0.5 rounded text-xs font-semibold bg-green-900 text-green-200">Ready</span>
+								{:else if item.status === "warning"}
+									<span class="px-2 py-0.5 rounded text-xs font-semibold bg-yellow-900 text-yellow-200">Warning</span>
+								{:else}
+									<span class="px-2 py-0.5 rounded text-xs font-semibold bg-red-900 text-red-200">Invalid</span>
+								{/if}
 
-		mergeConfig({ knownMods: [...getConfig().knownMods, json5.parse(window.fs.readFileSync(window.path.join("..", "Mods", window.fs.readdirSync("./staging")[0], "manifest.json"), "utf8")).id] })
+								<Button
+									kind="ghost"
+									size="small"
+									icon={TrashCan}
+									iconDescription="Remove"
+									on:click={() => removeStagedMod(item.id)}
+								/>
+							</div>
+						</div>
 
-		window.fs.removeSync("./staging")
+						{#if item.status === "invalid"}
+							<div class="mt-2 text-xs text-red-400 bg-red-950/50 p-2 rounded border border-red-900/50">
+								{#each item.errors as error}
+									<div>• {error}</div>
+								{/each}
+							</div>
+						{/if}
 
-		window.location.href = "/modList"
-	}}
->
-	<p>
-		This mod contains Peacock plugins; if you use the Peacock server emulator after applying this mod, the mod's plugins will have complete control over your PC. Make sure you trust whoever
-		developed this mod, and wherever you downloaded it from. Are you sure you want to add this mod?
-	</p>
+						{#if item.status === "warning"}
+							<div class="mt-2 text-xs text-yellow-400 bg-yellow-950/50 p-2 rounded border border-yellow-900/50">
+								{#each item.warnings as warning}
+									<div>• {warning}</div>
+								{/each}
+							</div>
+						{/if}
+
+						{#if item.type === "rpkg" && item.status !== "invalid"}
+							<div class="mt-2 flex flex-col gap-1">
+								<label class="text-xs text-neutral-400" for="rpkgName-{item.id}">Mod folder name:</label>
+								<input
+									id="rpkgName-{item.id}"
+									type="text"
+									class="px-3 py-1.5 rounded bg-neutral-900 border border-neutral-700 text-sm text-white focus:outline-none focus:border-blue-500 w-full"
+									bind:value={item.rpkgNameInput}
+								/>
+							</div>
+						{/if}
+
+						{#if item.type === "framework" && item.status !== "invalid"}
+							<div class="mt-2 text-xs text-neutral-400">
+								Contains {item.mods.length} framework mod{item.mods.length > 1 ? 's' : ''}:
+								<ul class="list-disc list-inside mt-1 ml-2 text-neutral-300">
+									{#each item.mods as m}
+										<li>{m.name} <span class="text-neutral-500">({m.id})</span></li>
+									{/each}
+								</ul>
+							</div>
+						{/if}
+					</div>
+				{/each}
+			</div>
+		{/if}
+	</div>
 </Modal>
 
 <Modal
@@ -767,12 +954,12 @@
 	on:click:button--secondary={() => (autoInstallModalOpen = false)}
 	on:click:button--primary={() => {
 		autoInstallModalOpen = false
-		modFilePath = "./tempArchive"
-		addMod()
+		stageFiles(["./tempArchive"])
 	}}
 >
 	<p>The mod {autoInstallModName} has been downloaded via a link - would you like to install it?</p>
 </Modal>
+{/if}
 
 <style>
 	:global(.bx--btn--ghost) {

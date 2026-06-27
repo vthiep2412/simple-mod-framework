@@ -13,8 +13,13 @@ import jsonPatchSchema from "$lib/json-patch-schema.json"
 import memoize from "lodash.memoize"
 import merge from "lodash.mergewith"
 import semver from "semver"
+import { writable } from "svelte/store"
 
 export const FrameworkVersion = "2.33.40"
+
+let cachedConfig: Config | null = null
+let loadOrderValidated = false
+export const configStore = writable<Config | null>(null)
 
 const validateManifest = new Ajv({ strict: false }).compile(manifestSchema)
 
@@ -26,20 +31,31 @@ const validateContract = new Ajv({ strict: false }).compile(contractSchema)
 const validateJSONPatch = new Ajv({ strict: false }).compile(jsonPatchSchema)
 
 export function getConfig() {
+	if (cachedConfig && loadOrderValidated) {
+		configStore.set(cachedConfig)
+		return cachedConfig
+	}
+
 	const config: Config = json5.parse(String(window.fs.readFileSync("../config.json", "utf8")))
+
+	config.knownMods = config.knownMods || []
+	config.developerMode = config.developerMode || false
 
 	// Remove duplicate items in load order
 	config.loadOrder = config.loadOrder.filter((value, index, array) => array.indexOf(value) === index)
 
-	// Remove non-existent mods from load order
-	config.loadOrder = config.loadOrder.filter((value) => {
-		try {
-			getModFolder(value)
-			return true
-		} catch {
-			return false
-		}
-	})
+	if (modsCacheInitialized) {
+		// Remove non-existent mods from load order
+		config.loadOrder = config.loadOrder.filter((value) => {
+			try {
+				getModFolder(value)
+				return true
+			} catch {
+				return false
+			}
+		})
+		loadOrderValidated = true
+	}
 
 	// Validate mod options
 	config.loadOrder.forEach((mod) => {
@@ -135,6 +151,9 @@ export function getConfig() {
 }
 
 export function setConfig(config: Config) {
+	cachedConfig = config
+	loadOrderValidated = modsCacheInitialized
+	configStore.set(config)
 	window.fs.writeFileSync("../config.json", json5.stringify(config))
 }
 
@@ -322,11 +341,199 @@ export function alterModManifest(modID: string, data: Partial<Manifest>) {
 	setModManifest(modID, manifest)
 }
 
-export function setModManifest(modID: string, manifest: Manifest) {
-	window.fs.writeFileSync(window.path.join(getModFolder(modID), "manifest.json"), JSON.stringify(manifest, undefined, "\t"))
+let modsCacheInitialized = false
+let modsList: string[] = []
+const manifestsMap = new Map<string, Manifest>()
+const foldersMap = new Map<string, string>()
+const isFrameworkMap = new Map<string, boolean>()
+
+export function clearModsCache() {
+	modsCacheInitialized = false
+	loadOrderValidated = false
+	cachedConfig = null
+	preloadModsCache("clearModsCache", true)
 }
 
-export const getModFolder = memoize(function (id: string) {
+export let cacheLoadStartTimestamp: number | null = null
+export let cacheLoadStartCaller: string | null = null
+
+let cacheGeneration = 0
+let cacheLoadingPromise: Promise<void> | null = null
+
+export function preloadModsCache(caller?: string, force = false): Promise<void> {
+	if (modsCacheInitialized && !force) {
+		return Promise.resolve()
+	}
+	if (cacheLoadingPromise && !force) {
+		return cacheLoadingPromise
+	}
+
+	cacheLoadStartTimestamp = Date.now()
+	cacheLoadStartCaller = caller || "unknown"
+
+	const currentGeneration = ++cacheGeneration
+
+	cacheLoadingPromise = (async () => {
+		try {
+			const modsDir = window.path.join("..", "Mods")
+			if (!(await window.fs.pathExists(modsDir))) {
+				if (currentGeneration !== cacheGeneration) {
+					await cacheLoadingPromise
+					return
+				}
+				modsList = []
+				manifestsMap.clear()
+				foldersMap.clear()
+				isFrameworkMap.clear()
+				modsCacheInitialized = true
+				return
+			}
+
+			const subdirs = await window.fs.readdir(modsDir)
+			const tempModsList: string[] = []
+			const tempManifestsMap = new Map<string, Manifest>()
+			const tempFoldersMap = new Map<string, string>()
+			const tempIsFrameworkMap = new Map<string, boolean>()
+
+			for (const subdir of subdirs) {
+				if (subdir === "Managed by SMF, do not touch") {
+					continue
+				}
+
+				const fullPath = window.path.resolve(window.path.join(modsDir, subdir))
+				const manifestPath = window.path.join(fullPath, "manifest.json")
+
+				if (await window.fs.pathExists(manifestPath)) {
+					try {
+						const manifestContent = await window.fs.readFile(manifestPath, "utf8")
+						const manifest = json5.parse(String(manifestContent)) as Manifest
+						const id = manifest.id
+						if (id) {
+							tempModsList.push(id)
+							tempManifestsMap.set(id, manifest)
+							tempFoldersMap.set(id, fullPath)
+							tempIsFrameworkMap.set(id, true)
+						} else {
+							const idFallback = subdir
+							tempModsList.push(idFallback)
+							tempFoldersMap.set(idFallback, fullPath)
+							tempIsFrameworkMap.set(idFallback, false)
+						}
+					} catch (e) {
+						const idFallback = subdir
+						tempModsList.push(idFallback)
+						tempFoldersMap.set(idFallback, fullPath)
+						tempIsFrameworkMap.set(idFallback, false)
+					}
+				} else {
+					const id = subdir
+					tempModsList.push(id)
+					tempFoldersMap.set(id, fullPath)
+					tempIsFrameworkMap.set(id, false)
+				}
+			}
+
+			if (currentGeneration !== cacheGeneration) {
+				await cacheLoadingPromise
+				return
+			}
+
+			// Swap double-buffered cache
+			modsList = tempModsList
+			manifestsMap.clear()
+			tempManifestsMap.forEach((v, k) => manifestsMap.set(k, v))
+			foldersMap.clear()
+			tempFoldersMap.forEach((v, k) => foldersMap.set(k, v))
+			isFrameworkMap.clear()
+			tempIsFrameworkMap.forEach((v, k) => isFrameworkMap.set(k, v))
+			modsCacheInitialized = true
+		} catch (err) {
+			if (currentGeneration === cacheGeneration) {
+				console.error("Failed to preload mods cache:", err)
+			}
+		} finally {
+			if (currentGeneration === cacheGeneration) {
+				cacheLoadingPromise = null
+			}
+		}
+	})()
+
+	return cacheLoadingPromise
+}
+
+export function initializeModsCache() {
+	if (modsCacheInitialized) {
+		return
+	}
+	console.warn("[WARNING] Mods cache is not initialized. Performing synchronous disk scan fallback in initializeModsCache().")
+
+	modsList = []
+	manifestsMap.clear()
+	foldersMap.clear()
+	isFrameworkMap.clear()
+
+	const modsDir = window.path.join("..", "Mods")
+	if (!window.fs.existsSync(modsDir)) {
+		modsCacheInitialized = true
+		return
+	}
+
+	const subdirs = window.fs.readdirSync(modsDir)
+	for (const subdir of subdirs) {
+		if (subdir === "Managed by SMF, do not touch") {
+			continue
+		}
+
+		const fullPath = window.path.resolve(window.path.join(modsDir, subdir))
+		const manifestPath = window.path.join(fullPath, "manifest.json")
+
+		if (window.fs.existsSync(manifestPath)) {
+			try {
+				const manifestContent = window.fs.readFileSync(manifestPath, "utf8")
+				const manifest = json5.parse(String(manifestContent)) as Manifest
+				const id = manifest.id
+				if (id) {
+					modsList.push(id)
+					manifestsMap.set(id, manifest)
+					foldersMap.set(id, fullPath)
+					isFrameworkMap.set(id, true)
+				} else {
+					const idFallback = subdir
+					modsList.push(idFallback)
+					foldersMap.set(idFallback, fullPath)
+					isFrameworkMap.set(idFallback, false)
+				}
+			} catch (e) {
+				const idFallback = subdir
+				modsList.push(idFallback)
+				foldersMap.set(idFallback, fullPath)
+				isFrameworkMap.set(idFallback, false)
+			}
+		} else {
+			const id = subdir
+			modsList.push(id)
+			foldersMap.set(id, fullPath)
+			isFrameworkMap.set(id, false)
+		}
+	}
+
+	modsCacheInitialized = true
+}
+
+export function setModManifest(modID: string, manifest: Manifest) {
+	window.fs.writeFileSync(window.path.join(getModFolder(modID), "manifest.json"), JSON.stringify(manifest, undefined, "\t"))
+	clearValidationCache()
+	clearModsCache()
+}
+
+export function getModFolder(id: string): string {
+	initializeModsCache()
+	const cachedFolder = foldersMap.get(id)
+	if (cachedFolder) {
+		return cachedFolder
+	}
+
+	console.warn(`[WARNING] Cache miss for mod folder ID: ${id}. Performing synchronous fallback directory search.`)
 	const folder = modIsFramework(id)
 		? window.fs
 				.readdirSync(window.path.join("..", "Mods"))
@@ -334,58 +541,68 @@ export const getModFolder = memoize(function (id: string) {
 					(a) =>
 						window.fs.existsSync(window.path.join("..", "Mods", a, "manifest.json")) &&
 						json5.parse(String(window.fs.readFileSync(window.path.join("..", "Mods", a, "manifest.json"), "utf8"))).id === id
-				) // Find mod by ID
-		: window.path.join("..", "Mods", id) // Mod is an RPKG mod, use folder name
+				)
+		: id
 
 	if (!folder) {
 		window.alert(`The mod ${id} couldn't be located! This will likely cause issues in parts of the framework. If you deleted a mod folder, use the Delete Mod option next time.`)
-
-		if (getConfig().loadOrder.includes(id)) {
-			mergeConfig({
-				loadOrder: getConfig().loadOrder.filter((a) => a != id)
-			})
-		}
-
 		throw new Error(`Couldn't find mod ${id}`)
 	}
 
 	return window.path.resolve(window.path.join("..", "Mods", folder))
-})
+}
 
-export const modIsFramework = memoize(function (id: string) {
-	return !(
-		(
-			window.fs.existsSync(window.path.join("..", "Mods", id)) && // mod exists in folder
-			!window.fs.existsSync(window.path.join("..", "Mods", id, "manifest.json")) && // mod has no manifest
-			window
-				.klaw(window.path.join("..", "Mods", id), { nodir: true })
-				.map((a) => a.path)
-				.some((a) => a.endsWith(".rpkg"))
-		) // mod contains RPKG files
-	)
-})
+export function modIsFramework(id: string): boolean {
+	initializeModsCache()
+	const cachedValue = isFrameworkMap.get(id)
+	if (cachedValue !== undefined) {
+		return cachedValue
+	}
 
-export const getManifestFromModID = memoize(function (id: string, dummy = 1): Manifest {
+	const modPath = window.path.join("..", "Mods", id)
+	if (window.fs.existsSync(modPath)) {
+		return window.fs.existsSync(window.path.join(modPath, "manifest.json"))
+	}
+	return true
+}
+
+export function getManifestFromModID(id: string, dummy = 1): Manifest {
+	initializeModsCache()
+	const cachedManifest = manifestsMap.get(id)
+	if (cachedManifest) {
+		return cachedManifest
+	}
+
+	console.warn(`[WARNING] Cache miss for manifest ID: ${id}. Performing synchronous fallback file read.`)
 	if (modIsFramework(id)) {
 		return json5.parse(String(window.fs.readFileSync(window.path.join(getModFolder(id), "manifest.json"), "utf8")))
 	} else {
 		throw new Error(`Mod ${id} is not a framework mod`)
 	}
-})
+}
 
-export const getAllMods = memoize(function () {
-	return window.fs
-		.readdirSync(window.path.join("..", "Mods"))
-		.filter((a) => a !== "Managed by SMF, do not touch")
-		.map((a) => window.path.resolve(window.path.join("..", "Mods", a)))
-		.map((a) =>
-			window.fs.existsSync(window.path.join(a, "manifest.json"))
-				? (json5.parse(String(window.fs.readFileSync(window.path.join(a, "manifest.json"), "utf8"))).id as string)
-				: a.split(window.path.sep).pop()!
-		)
-})
+export function getAllMods(): string[] {
+	initializeModsCache()
+	return [...modsList]
+}
+
+const validationCache = new Map<string, [boolean, string]>()
+
+export function clearValidationCache() {
+	validationCache.clear()
+}
 
 export function validateModFolder(modFolder: string): [boolean, string] {
+	if (validationCache.has(modFolder)) {
+		return validationCache.get(modFolder)!
+	}
+
+	const result = performValidation(modFolder)
+	validationCache.set(modFolder, result)
+	return result
+}
+
+function performValidation(modFolder: string): [boolean, string] {
 	if (!window.fs.existsSync(window.path.join(modFolder, "manifest.json"))) {
 		return [false, "No manifest"]
 	}

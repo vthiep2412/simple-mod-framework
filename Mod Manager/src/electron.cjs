@@ -18,10 +18,14 @@ const dev = !app.isPackaged
 let mainWindow
 
 function createWindow() {
-	if (!fs.existsSync(path.join("..", "Deploy.exe"))) {
+	if (!dev && !fs.existsSync(path.join("..", "Deploy.exe"))) {
 		process.chdir(path.dirname(app.getPath("exe")))
-		app.relaunch({ execPath: app.getPath("exe"), args: process.argv })
+		app.relaunch({ execPath: app.getPath("exe"), args: process.argv.slice(1) })
 		app.exit()
+	}
+
+	if (!fs.existsSync(path.join("..", "Mods"))) {
+		fs.mkdirSync(path.join("..", "Mods"))
 	}
 
 	let windowState = windowStateManager({
@@ -156,7 +160,7 @@ ipcMain.on("modFileOpenDialog", () => {
 			title: "Add a mod file",
 			buttonLabel: "Select",
 			filters: [{ name: "Mod Files", extensions: ["zip", "7z", "rar", "rpkg"] }],
-			properties: ["openFile", "dontAddToRecent"]
+			properties: ["openFile", "multiSelections", "dontAddToRecent"]
 		})
 	)
 })

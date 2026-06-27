@@ -85,7 +85,8 @@ if (fs.existsSync(path.join(core.config.retailPath, "Runtime", "chunk0.rpkg"))) 
 core.config.platform = fs.existsSync(path.join(core.config.retailPath, "Runtime", "chunk0.rpkg"))
 	? gameHashes[md5File.sync(path.join(core.config.retailPath, "..", "MicrosoftGame.Config"))]
 	: gameHashes[md5File.sync(path.join(core.config.runtimePath, "..", "Retail", "HITMAN3.exe"))] // Platform detection
-
+// why someone build these bad ui and i have to fix?
+// btw why ignore these bellow linting problem 👍 👇?
 let sentryTransaction = {
 	startChild(...args) {
 		return {
@@ -132,6 +133,7 @@ function configureSentryScope(transaction: Span) {
 	// 	})
 }
 // meh
+// meh what?
 function toHuman(dur: Duration) {
 	const units: (keyof DurationLikeObject)[] = ["years", "months", "days", "hours", "minutes", "seconds", "milliseconds"]
 	const smallestIdx = units.indexOf("seconds")
@@ -148,6 +150,12 @@ process.on("SIGINT", () => void core.logger.error("Received SIGINT signal"))
 process.on("SIGTERM", () => void core.logger.error("Received SIGTERM signal"))
 
 async function doTheThing() {
+	if (typeof core.config.platform === "undefined") {
+		await core.logger.error(
+			"Unknown game version. If the game has recently updated, wait for a framework update to be released; the developers are already aware. If you're using a cracked version of the game, that's the problem."
+		)
+	}
+
 	const startedDate = DateTime.now()
 
 	if (core.config.reportErrors) {
