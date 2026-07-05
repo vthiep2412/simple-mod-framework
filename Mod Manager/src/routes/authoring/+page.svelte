@@ -10,8 +10,13 @@
 	let cacheLoaded = false
 
 	onMount(async () => {
-		await preloadModsCache("authoring")
-		cacheLoaded = true
+		try {
+			await preloadModsCache("authoring")
+		} catch (err) {
+			console.error("Failed to load mods cache for authoring:", err)
+		} finally {
+			cacheLoaded = true
+		}
 	})
 </script>
 

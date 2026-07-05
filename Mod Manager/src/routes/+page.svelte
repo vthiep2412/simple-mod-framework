@@ -15,7 +15,7 @@
 
 	import { Button, InlineLoading, Modal, ProgressBar } from "carbon-components-svelte"
 
-	import { getAllMods, getConfig, getManifestFromModID, modIsFramework, getModFolder, mergeConfig, FrameworkVersion, clearModsCache, preloadModsCache, cacheLoadStartTimestamp, cacheLoadStartCaller, removeDirectoryRecursive } from "$lib/utils"
+	import { getAllMods, getConfig, getManifestFromModID, modIsFramework, getModFolder, mergeConfig, FrameworkVersion, clearModsCache, preloadModsCache, cacheLoadStartTimestamp, cacheLoadStartCaller, removeDirectoryRecursive, trustedHosts } from "$lib/utils"
 
 	import { v4 } from "uuid"
 	import { marked } from "marked"
@@ -503,6 +503,11 @@
 
 		try {
 			const url = new URL(updatingMod!.url)
+			if (url.protocol !== "https:") {
+				window.alert("Security error: Update URL must use HTTPS protocol")
+				updatingMod = null
+				return
+			}
 			if (!(trustedHosts.has(url.hostname) || url.hostname.split(".").slice(-2).join(".") === "github.io")) {
 				window.alert("Security error: Untrusted host for mod update: " + url.hostname)
 				updatingMod = null
@@ -579,8 +584,6 @@
 		modUpdatesPromise = checkForModUpdates(true)
 		modUpdates = modUpdatesPromise
 	}
-
-	const trustedHosts = new Set(["github.com", "raw.githubusercontent.com", "dropbox.com", "dl.dropboxusercontent.com", "drive.google.com", "hitman-resources.netlify.app"])
 </script>
 
 <div class="w-full h-full overflow-y-auto flex items-center justify-center gap-96">

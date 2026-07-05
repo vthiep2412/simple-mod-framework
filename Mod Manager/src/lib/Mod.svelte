@@ -8,7 +8,6 @@
 
 	import semver from "semver"
 	import { goto } from "$app/navigation"
-	import { onMount } from "svelte"
 
 	export let isFrameworkMod: boolean
 
@@ -17,15 +16,8 @@
 
 	export let darken: boolean = false
 
-	let modValidation: [boolean, string] = [true, ""]
-
-	onMount(() => {
-		if (isFrameworkMod && manifest && manifest.id) {
-			setTimeout(() => {
-				modValidation = validateModFolder(getModFolder(manifest.id))
-			}, 0)
-		}
-	})
+	let modValidation: [boolean, string]
+	$: modValidation = isFrameworkMod && manifest && manifest.id ? validateModFolder(getModFolder(manifest.id)) : [true, ""]
 </script>
 
 <Tile style={darken ? "filter: brightness(0.75); transition: 250ms filter" : "transition: 250ms filter"}>

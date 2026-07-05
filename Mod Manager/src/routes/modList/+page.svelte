@@ -46,7 +46,8 @@
 		clearModsCache,
 		clearValidationCache,
 		preloadModsCache,
-		removeDirectoryRecursive
+		removeDirectoryRecursive,
+		trustedHosts
 	} from "$lib/utils"
 	import Mod from "$lib/Mod.svelte"
 	import TextInputModal from "$lib/TextInputModal.svelte"
@@ -776,8 +777,6 @@
 	let autoInstallDownloadSize = 0
 	let autoInstallModName = ""
 	let autoInstallModalOpen = false
-
-	const trustedHosts = new Set(["github.com", "raw.githubusercontent.com", "dropbox.com", "dl.dropboxusercontent.com", "drive.google.com", "hitman-resources.netlify.app"])
 
 	$: if ($page.url.searchParams.get("urlScheme")) {
 		;(async () => {

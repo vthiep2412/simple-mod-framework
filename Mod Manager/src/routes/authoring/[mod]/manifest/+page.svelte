@@ -27,9 +27,14 @@
 	let cacheLoaded = false
 
 	onMount(async () => {
-		await preloadModsCache("authoring-manifest")
-		cacheLoaded = true
-		dummyForceUpdate = Math.random()
+		try {
+			await preloadModsCache("authoring-manifest")
+		} catch (err) {
+			console.error("Failed to preload mods cache for authoring-manifest:", err)
+		} finally {
+			cacheLoaded = true
+			dummyForceUpdate = Math.random()
+		}
 	})
 
 	$: if (cacheLoaded && $page.params.mod) {

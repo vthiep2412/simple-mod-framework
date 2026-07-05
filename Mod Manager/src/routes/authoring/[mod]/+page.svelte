@@ -34,13 +34,31 @@
 	let cacheLoaded = false
 
 	onMount(async () => {
-		await preloadModsCache("authoring-mod")
-		cacheLoaded = true
-		dummyForceUpdate = Math.random()
+		try {
+			await preloadModsCache("authoring-mod")
+			dummyForceUpdate = Math.random()
+		} catch (err) {
+			console.error("Failed to preload mods cache:", err)
+		} finally {
+			cacheLoaded = true
+		}
 	})
 
 	$: if (cacheLoaded && $page.params.mod) {
-		manifest = getManifestFromModID($page.params.mod, dummyForceUpdate)
+		try {
+			manifest = getManifestFromModID($page.params.mod, dummyForceUpdate)
+		} catch (err) {
+			console.error("Failed to load manifest:", err)
+			manifest = {
+				version: "1.0.0",
+				id: $page.params.mod,
+				name: "Invalid or Missing Mod",
+				description: "This mod could not be loaded or its manifest is missing.",
+				authors: ["Unknown"],
+				contentFolders: [],
+				frameworkVersion: FrameworkVersion
+			} as Manifest
+		}
 	}
 
 	let modNameInputModal: TextInputModal

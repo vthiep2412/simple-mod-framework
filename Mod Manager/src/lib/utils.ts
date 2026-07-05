@@ -16,6 +16,7 @@ import semver from "semver"
 import { writable } from "svelte/store"
 
 export const FrameworkVersion = "2.33.40"
+export const trustedHosts = new Set(["github.com", "raw.githubusercontent.com", "dropbox.com", "dl.dropboxusercontent.com", "drive.google.com", "hitman-resources.netlify.app"])
 
 let cachedConfig: Config | null = null
 let loadOrderValidated = false
@@ -37,6 +38,11 @@ export function validateConfigOptions(config: Config) {
 
 	// Initialize modOptions if missing
 	config.modOptions = config.modOptions || {}
+
+	// Initialize loadOrder if missing or not an array
+	if (!Array.isArray(config.loadOrder)) {
+		config.loadOrder = []
+	}
 
 	// Remove duplicate items in load order
 	config.loadOrder = config.loadOrder.filter((value, index, array) => array.indexOf(value) === index)
@@ -686,6 +692,16 @@ export function validateModFolder(modFolder: string): [boolean, string] {
 
 		const result = performValidation(modFolder)
 		validationCache.set(modFolder, result)
+
+		// Evict older cache entries for this mod to prevent orphaned keys
+		const prefix = `val-cache:${manifestPath}:`
+		for (let i = localStorage.length - 1; i >= 0; i--) {
+			const key = localStorage.key(i)
+			if (key && key.startsWith(prefix)) {
+				localStorage.removeItem(key)
+			}
+		}
+
 		localStorage.setItem(cacheKey, JSON.stringify(result))
 		return result
 	} catch (err) {
