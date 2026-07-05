@@ -20,13 +20,18 @@
 	let modValidation: [boolean, string] = [true, ""]
 	let validationTimeout: any
 
-	$: if (isFrameworkMod && manifest && manifest.id) {
+	$: {
 		clearTimeout(validationTimeout)
-		validationTimeout = setTimeout(() => {
-			modValidation = validateModFolder(getModFolder(manifest.id))
-		}, 0)
-	} else {
-		modValidation = [true, ""]
+		if (isFrameworkMod && manifest && manifest.id) {
+			const targetId = manifest.id
+			validationTimeout = setTimeout(() => {
+				if (isFrameworkMod && manifest && manifest.id === targetId) {
+					modValidation = validateModFolder(getModFolder(targetId))
+				}
+			}, 0)
+		} else {
+			modValidation = [true, ""]
+		}
 	}
 
 	onDestroy(() => {
