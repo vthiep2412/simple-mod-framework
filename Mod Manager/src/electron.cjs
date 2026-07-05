@@ -2,6 +2,7 @@ const windowStateManager = require("electron-window-state")
 const contextMenu = require("electron-context-menu")
 const { app, BrowserWindow, ipcMain, dialog } = require("electron")
 const serve = require("electron-serve")
+const { spawn, execSync } = require("child_process");
 const fs = require("fs")
 const path = require("path")
 
@@ -170,14 +171,14 @@ ipcMain.on("deploy", () => {
 		deployStartTime = null
 
 		if (err) {
-			deployOutput = "Failed to start Deploy.exe: " + err.message
+			deployOutput = `Failed to start Deploy.exe: ${err?.message || String(err)}`
 			mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
 		}
 		mainWindow.webContents.send("frameworkDeployFinished")
 	}
 
 	try {
-		deployProcess = require("child_process").spawn("Deploy.exe --doNotPause --colors", [], {
+		deployProcess = spawn("Deploy.exe --doNotPause --colors", [], {
 			shell: true,
 			cwd: ".."
 		})
@@ -198,8 +199,12 @@ ipcMain.on("deploy", () => {
 			mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
 		})
 
-		deployProcess.on("close", () => {
-			cleanupDeploy(null)
+		deployProcess.on("close", (code, signal) => {
+			if (code !== 0) {
+				cleanupDeploy(new Error(`Deploy.exe exited with code ${code} and signal ${signal}`))
+			} else {
+				cleanupDeploy(null)
+			}
 		})
 	} catch (err) {
 		cleanupDeploy(err)
@@ -210,6 +215,18 @@ ipcMain.on("checkDeployStatus", () => {
 	if (isDeploying) {
 		mainWindow.webContents.send("frameworkDeployModalOpen", deployStartTime)
 		mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
+	}
+})
+
+ipcMain.on("killDeployProcess", () => {
+	if (deployProcess && deployProcess.pid) {
+		try {
+			const pid = deployProcess.pid
+			execSync(`taskkill /f /t /pid ${pid}`)
+		} catch (e) {
+			console.error("Error killing deploy process tree:", e)
+		}
+		deployProcess = null
 	}
 })
 

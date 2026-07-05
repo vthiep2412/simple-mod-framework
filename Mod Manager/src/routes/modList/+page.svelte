@@ -128,6 +128,11 @@
 
 	let changed = false
 
+	function markChanged() {
+		changed = true
+		deployFinished = false
+	}
+
 	let showDropHint = false
 	let dependencyCycleModalOpen = false
 	let frameworkDeployModalOpen = false
@@ -349,21 +354,22 @@
 			hasError = true
 			statusLabel = "Deployment failed"
 
-			// Kill rpkg-cli to prevent process leak
-			try {
-				window.child_process.execSync("taskkill /f /im rpkg-cli.exe")
-			} catch (e: any) {
-				// Ignore ENOENT errors (file not found, process already killed)
-				if (e.code !== "ENOENT") {
-					console.error("Error killing rpkg-cli:", e)
-				}
-			}
+			// Kill deploy process tree to prevent process leak
+			window.ipc.send("killDeployProcess")
 
 			if (!errorMessage) {
 				const lastErrorLine = [...lines].reverse().find((a) => a.includes("Error:") || a.includes("ERROR") || a.includes("uncaughtException"))
 				errorMessage = lastErrorLine ? lastErrorLine.replace(/.*(ERROR.*?\t|Error:\s*)/, "").trim() : "The deployment process terminated unexpectedly."
 			}
 		}
+	})
+
+	window.ipc.receive("modFileOpenDialogResult", (modFilePopupResult: string[] | undefined) => {
+		if (!modFilePopupResult || modFilePopupResult.length === 0) {
+			return
+		}
+
+		stageFiles(modFilePopupResult)
 	})
 
 	document.addEventListener("drop", (event) => {
@@ -411,14 +417,17 @@
 
 	function execFileAsync(file: string, args: string[]): Promise<string> {
 		return new Promise((resolve, reject) => {
-			activeStagingProcess = window.child_process.execFile(file, args, (error: any, stdout: any, stderr: any) => {
-				activeStagingProcess = null
+			const proc = window.child_process.execFile(file, args, (error: any, stdout: any, stderr: any) => {
+				if (activeStagingProcess === proc) {
+					activeStagingProcess = null
+				}
 				if (error) {
 					reject(error)
 				} else {
 					resolve(stdout)
 				}
 			})
+			activeStagingProcess = proc
 		})
 	}
 
@@ -615,7 +624,9 @@
 			}
 			stagedMods = stagedMods
 		} finally {
-			stageInProgress = false
+			if (runId === currentStagingRunId) {
+				stageInProgress = false
+			}
 		}
 	}
 
@@ -626,7 +637,7 @@
 		for (const staged of modsToImport) {
 			if (staged.type === "framework") {
 				for (const mod of staged.mods) {
-					const existingFolder = foldersMap.get(mod.id)
+					const existingFolder = getConfig().knownMods.includes(mod.id) ? getModFolder(mod.id) : null
 					const destFolder = existingFolder || window.path.join("..", "Mods", mod.id)
 					if (window.fs.existsSync(destFolder)) {
 						existingNames.push(mod.name || mod.id)
@@ -652,12 +663,17 @@
 		for (const staged of modsToImport) {
 			if (staged.type === "framework") {
 				for (const mod of staged.mods) {
-					const existingFolder = foldersMap.get(mod.id)
+					const existingFolder = getConfig().knownMods.includes(mod.id) ? getModFolder(mod.id) : null
 					const destFolder = existingFolder || window.path.join("..", "Mods", mod.id)
+					const tempDest = destFolder + ".tmp"
+					if (window.fs.existsSync(tempDest)) {
+						window.fs.removeSync(tempDest)
+					}
+					window.fs.copySync(mod.folder, tempDest)
 					if (window.fs.existsSync(destFolder)) {
 						window.fs.removeSync(destFolder)
 					}
-					window.fs.copySync(mod.folder, destFolder)
+					window.fs.renameSync(tempDest, destFolder)
 
 					if (!getConfig().knownMods.includes(mod.id)) {
 						mergeConfig({
@@ -669,19 +685,25 @@
 				const rawName = staged.rpkgNameInput ? staged.rpkgNameInput.trim() : staged.fileName.replace(/\.[^/.]+$/, "")
 				const modName = sanitizeModName(rawName)
 				const destFolder = window.path.join("..", "Mods", modName)
-				if (window.fs.existsSync(destFolder)) {
-					window.fs.removeSync(destFolder)
+				const tempDest = destFolder + ".tmp"
+				if (window.fs.existsSync(tempDest)) {
+					window.fs.removeSync(tempDest)
 				}
 
 				for (const mod of staged.mods) {
 					if (mod.rpkgs) {
 						for (const file of mod.rpkgs) {
-							const destDir = window.path.join("..", "Mods", modName, file.chunk)
+							const destDir = window.path.join(tempDest, file.chunk)
 							window.fs.ensureDirSync(destDir)
 							window.fs.copyFileSync(file.path, window.path.join(destDir, window.path.basename(file.path)))
 						}
 					}
 				}
+
+				if (window.fs.existsSync(destFolder)) {
+					window.fs.removeSync(destFolder)
+				}
+				window.fs.renameSync(tempDest, destFolder)
 
 				if (!getConfig().knownMods.includes(modName)) {
 					mergeConfig({
@@ -693,15 +715,13 @@
 
 		try {
 			window.fs.removeSync("./staging")
-		} catch (e) {
-			// ignore cleanup errors
-		}
+		} catch {}
 
 		clearModsCache()
 		clearValidationCache()
 
 		forceModListsUpdate = Math.random()
-		changed = true
+		markChanged()
 
 		bulkImportModalOpen = false
 		stagedMods = []
@@ -750,14 +770,6 @@
 
 	function openAddModDialog() {
 		window.ipc.send("modFileOpenDialog")
-
-		window.ipc.receive("modFileOpenDialogResult", (modFilePopupResult: string[] | undefined) => {
-			if (!modFilePopupResult || modFilePopupResult.length === 0) {
-				return
-			}
-
-			stageFiles(modFilePopupResult)
-		})
 	}
 
 	let displayExtractedModsDialog = false
@@ -780,63 +792,56 @@
 
 	$: if ($page.url.searchParams.get("urlScheme")) {
 		;(async () => {
-			let chunksAll
-
 			try {
 				const downloadUrl = $page.url.searchParams.get("urlScheme")!
 				const url = new URL(downloadUrl)
-				if (!(trustedHosts.has(url.hostname) || url.hostname.split(".").slice(-2).join(".") === "github.io")) {
-					window.alert("Security error: Untrusted host for mod download: " + url.hostname)
+				if (url.protocol !== "https:" || !trustedHosts.has(url.hostname)) {
+					window.alert("Security error: Untrusted host or protocol for mod download: " + url.hostname)
 					return
 				}
-			} catch (err) {
-				window.alert("Security error: Invalid download URL")
-				return
-			}
 
-			try {
 				autoInstallDownloading = true
+				autoInstallDownloadProgress = 0
+				autoInstallDownloadSize = 0
 
-				const response = await fetch($page.url.searchParams.get("urlScheme")!)
-				const reader = response.body!.getReader()
-
+				const response = await fetch(downloadUrl)
+				if (!response.ok || !response.body) {
+					throw new Error(`Failed to fetch mod: ${response.statusText}`)
+				}
+				const reader = response.body.getReader()
 				autoInstallDownloadSize = +response.headers.get("Content-Length")!
 
+				window.fs.writeFileSync("./tempArchive", new Uint8Array(0)) // Clear file
+
 				let receivedLength = 0
-				let chunks = []
 				while (true) {
 					const { done, value } = await reader.read()
-
 					if (done) {
 						break
 					}
-
-					chunks.push(value)
+					window.fs.appendFileSync("./tempArchive", value)
 					receivedLength += value.length
-
 					autoInstallDownloadProgress = receivedLength
 				}
 
-				chunksAll = new Uint8Array(receivedLength)
-				let position = 0
-				for (let chunk of chunks) {
-					chunksAll.set(chunk, position)
-					position += chunk.length
+				window.fs.emptyDirSync("./staging")
+				window.child_process.execSync(`"..\\Third-Party\\7z.exe" x "./tempArchive" -aoa -y -o"./staging"`)
+
+				const rootFiles = window.fs.readdirSync("./staging")
+				if (rootFiles.length === 0) {
+					throw new Error("Extracted staging folder is empty")
 				}
-			} catch (e) {
-				window.alert("Couldn't download the mod! Check your internet connection, or contact the mod author for help.\n\n" + e)
+				const manifestPath = window.path.join("./staging", rootFiles[0], "manifest.json")
+				if (!window.fs.existsSync(manifestPath)) {
+					throw new Error("No manifest.json found in the extracted mod")
+				}
+				autoInstallModName = json5.parse(window.fs.readFileSync(manifestPath, "utf8")).name
+				autoInstallModalOpen = true
+			} catch (e: any) {
+				window.alert("Couldn't download or extract the mod! Check your internet connection, or contact the mod author for help.\n\n" + (e.message || e))
+			} finally {
 				autoInstallDownloading = false
-				return
 			}
-
-			window.fs.writeFileSync("./tempArchive", chunksAll)
-
-			window.fs.emptyDirSync("./staging")
-			window.child_process.execSync(`"..\\Third-Party\\7z.exe" x "./tempArchive" -aoa -y -o"./staging"`)
-
-			autoInstallDownloading = false
-			autoInstallModName = json5.parse(window.fs.readFileSync(window.path.join("./staging", window.fs.readdirSync("./staging")[0], "manifest.json"), "utf8")).name
-			autoInstallModalOpen = true
 		})()
 	}
 
@@ -845,7 +850,7 @@
 			loadOrder: event.detail.map((a: any) => a.value)
 		})
 		forceModListsUpdate = Math.random()
-		changed = true
+		markChanged()
 	}
 </script>
 
@@ -892,7 +897,7 @@
 										mergeConfig({
 											loadOrder: [...getConfig().loadOrder, item.value]
 										})
-										changed = true
+										markChanged()
 										forceModListsUpdate = Math.random()
 									}}
 								>
@@ -970,7 +975,7 @@
 									mergeConfig({
 										loadOrder: getConfig().loadOrder.filter((a) => a != item.value)
 									})
-									changed = true
+									markChanged()
 									forceModListsUpdate = Math.random()
 								}}
 							>
@@ -1004,7 +1009,7 @@
 			clearModsCache()
 			clearValidationCache()
 			forceModListsUpdate = Math.random()
-			changed = true
+			markChanged()
 			deleteModModalOpen = false
 		}}
 		shouldSubmitOnEnter={false}
@@ -1043,7 +1048,9 @@
 			{/if}
 			<div class="bx--progress-bar__helper-text mt-1 text-xs text-gray-400 font-mono flex justify-between">
 				{#if hasError}
-					<span class="text-red-400 font-bold">Failed in {elapsedTimeStr}</span>
+					{#if elapsedTimeStr.includes("m") || parseInt(elapsedTimeStr) > 5}
+						<span class="text-red-400 font-bold">Failed in {elapsedTimeStr}</span>
+					{/if}
 				{:else if deployFinished}
 					<span class="text-green-400 font-bold">Done in {elapsedTimeStr}</span>
 				{:else}
@@ -1061,8 +1068,8 @@
 
 			{#if deployWarnings.length > 0}
 				<div
-					class="w-[240px] min-h-[25vh] max-h-[35vh] overflow-y-auto bg-neutral-800 p-2 border border-yellow-600/40 rounded-sm text-yellow-300 text-xs flex flex-col gap-1"
-					style="font-family: 'Fira Code', 'IBM Plex Mono', monospace; color-scheme: dark;"
+					class="min-h-[25vh] max-h-[35vh] overflow-y-auto bg-neutral-800 p-2 border border-yellow-600/40 rounded-sm text-yellow-300 text-xs flex flex-col gap-1"
+					style="width: 260px; font-family: 'Fira Code', 'IBM Plex Mono', monospace; color-scheme: dark;"
 				>
 					<div class="font-bold border-b border-yellow-600/30 pb-1 mb-1 sticky top-0 bg-neutral-800 z-10">Warnings</div>
 					{#each deployWarnings as warning}
@@ -1302,5 +1309,11 @@
 
 	:global(.bx--snippet.bx--snippet--single) {
 		background-color: #262626;
+	}
+
+	@media (min-width: 82rem) {
+		:global(.bx--modal-container) {
+			width: 56%;
+		}
 	}
 </style>

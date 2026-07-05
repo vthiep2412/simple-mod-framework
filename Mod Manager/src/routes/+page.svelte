@@ -15,7 +15,7 @@
 
 	import { Button, InlineLoading, Modal, ProgressBar } from "carbon-components-svelte"
 
-	import { getAllMods, getConfig, getManifestFromModID, modIsFramework, getModFolder, mergeConfig, FrameworkVersion, clearModsCache, preloadModsCache, cacheLoadStartTimestamp, cacheLoadStartCaller, removeDirectoryRecursive, trustedHosts } from "$lib/utils"
+	import { getAllMods, getConfig, getManifestFromModID, modIsFramework, getModFolder, mergeConfig, FrameworkVersion, clearModsCache, preloadModsCache, getCacheLoadStartTimestamp, getCacheLoadStartCaller, removeDirectoryRecursive, trustedHosts } from "$lib/utils"
 
 	import { v4 } from "uuid"
 	import { marked } from "marked"
@@ -63,8 +63,9 @@
 		try {
 			await preloadModsCache("homepage")
 
-			const startTimeStr = cacheLoadStartTimestamp ? `${new Date(cacheLoadStartTimestamp).toLocaleTimeString()} (${cacheLoadStartTimestamp})` : "not started yet"
-			const callerStr = cacheLoadStartCaller || "unknown"
+			const startTimestamp = getCacheLoadStartTimestamp()
+			const startTimeStr = startTimestamp ? `${new Date(startTimestamp).toLocaleTimeString()} (${startTimestamp})` : "not started yet"
+			const callerStr = getCacheLoadStartCaller() || "unknown"
 			console.warn(`[DEBUG] Homepage DOM loaded at ${new Date(domLoadedTime).toLocaleTimeString()} (${domLoadedTime}). Cache preload started by: ${callerStr} at time: ${startTimeStr}`)
 
 			try {

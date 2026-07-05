@@ -10,7 +10,6 @@ import repositorySchema from "$lib/repository-schema.json"
 import unlockablesSchema from "$lib/unlockables-schema.json"
 import contractSchema from "$lib/contract-schema.json"
 import jsonPatchSchema from "$lib/json-patch-schema.json"
-import memoize from "lodash.memoize"
 import merge from "lodash.mergewith"
 import semver from "semver"
 import { writable } from "svelte/store"
@@ -21,6 +20,12 @@ export const trustedHosts = new Set(["github.com", "raw.githubusercontent.com", 
 let cachedConfig: Config | null = null
 let loadOrderValidated = false
 export const configStore = writable<Config | null>(null)
+
+let modsCacheInitialized = false
+let modsList: string[] = []
+const manifestsMap = new Map<string, Manifest>()
+const foldersMap = new Map<string, string>()
+const isFrameworkMap = new Map<string, boolean>()
 
 const validateManifest = new Ajv({ strict: false }).compile(manifestSchema)
 
@@ -51,6 +56,7 @@ export function validateConfigOptions(config: Config) {
 	const missingMods = config.loadOrder.filter((value) => !foldersMap.has(value))
 
 	if (missingMods.length > 0) {
+		// skipcq: JS-0052, eslint-disable-next-line no-alert
 		window.alert(`The following mods could not be found:\n${missingMods.map(m => `- ${m}`).join("\n")}\n\nThey have been removed from your mods list.\n\nIf you intended to uninstall these mods, please use the "Delete Mod" option in the Mod Manager next time to ensure they are cleaned up properly. If you did not intend to uninstall them and this warning is shown, you can ignore this message.`)
 	}
 
@@ -343,12 +349,6 @@ export function alterModManifest(modID: string, data: Partial<Manifest>) {
 	setModManifest(modID, manifest)
 }
 
-let modsCacheInitialized = false
-let modsList: string[] = []
-const manifestsMap = new Map<string, Manifest>()
-const foldersMap = new Map<string, string>()
-const isFrameworkMap = new Map<string, boolean>()
-
 export function clearModsCache() {
 	modsCacheInitialized = false
 	loadOrderValidated = false
@@ -356,8 +356,16 @@ export function clearModsCache() {
 	preloadModsCache("clearModsCache", true)
 }
 
-export let cacheLoadStartTimestamp: number | null = null
-export let cacheLoadStartCaller: string | null = null
+let cacheLoadStartTimestamp: number | null = null
+let cacheLoadStartCaller: string | null = null
+
+export function getCacheLoadStartTimestamp() {
+	return cacheLoadStartTimestamp
+}
+
+export function getCacheLoadStartCaller() {
+	return cacheLoadStartCaller
+}
 
 let cacheGeneration = 0
 let cacheLoadingPromise: Promise<void> | null = null
@@ -428,7 +436,7 @@ export function preloadModsCache(caller?: string, force = false): Promise<void> 
 								tempFoldersMap.set(idFallback, fullPath)
 								tempIsFrameworkMap.set(idFallback, false)
 							}
-						} catch (e) {
+						} catch {
 							const idFallback = subdir
 							tempModsList.push(idFallback)
 							tempFoldersMap.set(idFallback, fullPath)
@@ -525,7 +533,7 @@ export function initializeModsCache() {
 					foldersMap.set(idFallback, fullPath)
 					isFrameworkMap.set(idFallback, false)
 				}
-			} catch (e) {
+			} catch {
 				const idFallback = subdir
 				modsList.push(idFallback)
 				foldersMap.set(idFallback, fullPath)
@@ -589,6 +597,7 @@ export function modIsFramework(id: string): boolean {
 }
 
 export function getManifestFromModID(id: string, dummy = 1): Manifest {
+	void dummy
 	initializeModsCache()
 	const cachedManifest = manifestsMap.get(id)
 	if (cachedManifest) {
@@ -614,7 +623,7 @@ export function clearValidationCache() {
 	validationCache.clear()
 	for (let i = localStorage.length - 1; i >= 0; i--) {
 		const key = localStorage.key(i)
-		if (key && key.startsWith("val-cache:")) {
+		if (key?.startsWith("val-cache:")) {
 			localStorage.removeItem(key)
 		}
 	}
@@ -639,7 +648,7 @@ export function validateModFolder(modFolder: string): [boolean, string] {
 			const manifest = json5.parse(manifestContent)
 			const contentDirs = [
 				...(manifest.contentFolders || []),
-				...(manifest.options || []).flatMap((opt: any) => opt.contentFolders || [])
+				...(manifest.options || []).flatMap((opt: { contentFolders?: string[] }) => opt.contentFolders || [])
 			]
 			for (const dir of contentDirs) {
 				const fullPath = window.path.resolve(modFolder, dir)
@@ -649,7 +658,7 @@ export function validateModFolder(modFolder: string): [boolean, string] {
 			}
 			const blobsDirs = [
 				...(manifest.blobsFolders || []),
-				...(manifest.options || []).flatMap((opt: any) => opt.blobsFolders || [])
+				...(manifest.options || []).flatMap((opt: { blobsFolders?: string[] }) => opt.blobsFolders || [])
 			]
 			for (const dir of blobsDirs) {
 				const fullPath = window.path.resolve(modFolder, dir)
@@ -697,20 +706,21 @@ export function validateModFolder(modFolder: string): [boolean, string] {
 		const prefix = `val-cache:${manifestPath}:`
 		for (let i = localStorage.length - 1; i >= 0; i--) {
 			const key = localStorage.key(i)
-			if (key && key.startsWith(prefix)) {
+			if (key?.startsWith(prefix)) {
 				localStorage.removeItem(key)
 			}
 		}
 
 		localStorage.setItem(cacheKey, JSON.stringify(result))
 		return result
-	} catch (err) {
+	} catch {
 		const result = performValidation(modFolder)
 		validationCache.set(modFolder, result)
 		return result
 	}
 }
 
+// skipcq: JS-R1005
 function performValidation(modFolder: string): [boolean, string] {
 	if (!window.fs.existsSync(window.path.join(modFolder, "manifest.json"))) {
 		return [false, "No manifest"]
@@ -836,7 +846,7 @@ export async function removeDirectoryRecursive(dirPath: string) {
 		return
 	} catch (initialErr) {
 		let removeSuccess = false
-		let removeError: any = initialErr
+		let removeError: unknown = initialErr
 
 		for (let attempt = 1; attempt <= 3; attempt++) {
 			try {
@@ -874,7 +884,5 @@ function makeWritableRecursive(dirPath: string) {
 		} else {
 			window.fs.chmodSync(dirPath, 0o666)
 		}
-	} catch (err) {
-		// Ignore permission errors during chmod in case some files are completely locked
-	}
+	} catch {}
 }
