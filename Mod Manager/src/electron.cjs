@@ -152,6 +152,30 @@ ipcMain.on("deploy", () => {
 	deployOutput = ""
 	deployStartTime = Date.now()
 
+	let cleanupCalled = false
+	const cleanupDeploy = (err) => {
+		if (cleanupCalled) return
+		cleanupCalled = true
+
+		if (deployProcess) {
+			try {
+				deployProcess.kill()
+			} catch {
+				// Ignore kill errors
+			}
+			deployProcess = null
+		}
+
+		isDeploying = false
+		deployStartTime = null
+
+		if (err) {
+			deployOutput = "Failed to start Deploy.exe: " + err.message
+			mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
+		}
+		mainWindow.webContents.send("frameworkDeployFinished")
+	}
+
 	try {
 		deployProcess = require("child_process").spawn("Deploy.exe --doNotPause --colors", [], {
 			shell: true,
@@ -159,12 +183,7 @@ ipcMain.on("deploy", () => {
 		})
 
 		deployProcess.on("error", (err) => {
-			isDeploying = false
-			deployProcess = null
-			deployStartTime = null
-			deployOutput = "Failed to start Deploy.exe: " + err.message
-			mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
-			mainWindow.webContents.send("frameworkDeployFinished")
+			cleanupDeploy(err)
 		})
 
 		mainWindow.webContents.send("frameworkDeployModalOpen", deployStartTime)
@@ -179,19 +198,11 @@ ipcMain.on("deploy", () => {
 			mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
 		})
 
-		deployProcess.on("close", (data) => {
-			isDeploying = false
-			deployProcess = null
-			deployStartTime = null
-			mainWindow.webContents.send("frameworkDeployFinished")
+		deployProcess.on("close", () => {
+			cleanupDeploy(null)
 		})
 	} catch (err) {
-		isDeploying = false
-		deployProcess = null
-		deployStartTime = null
-		deployOutput = "Failed to start Deploy.exe: " + err.message
-		mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
-		mainWindow.webContents.send("frameworkDeployFinished")
+		cleanupDeploy(err)
 	}
 })
 
