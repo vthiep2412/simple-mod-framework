@@ -16,6 +16,10 @@ const port = process.env.PORT || 3000
 const dev = !app.isPackaged
 /** @type BrowserWindow */
 let mainWindow
+let isDeploying = false
+let deployOutput = ""
+let deployProcess = null
+let deployStartTime = null
 
 function createWindow() {
 	if (!dev && !fs.existsSync(path.join("..", "Deploy.exe"))) {
@@ -61,8 +65,18 @@ function createWindow() {
 		})
 	}
 
-	mainWindow.on("close", () => {
-		windowState.saveState(mainWindow)
+	mainWindow.on("close", (event) => {
+		if (isDeploying) {
+			event.preventDefault()
+			dialog.showMessageBoxSync(mainWindow, {
+				type: "warning",
+				title: "Deployment in progress",
+				message: "A mod deployment is currently running. You cannot close the application until the deployment completes.",
+				buttons: ["OK"]
+			})
+		} else {
+			windowState.saveState(mainWindow)
+		}
 	})
 
 	return mainWindow
@@ -129,14 +143,21 @@ if (!lock) {
 }
 
 ipcMain.on("deploy", () => {
-	let deployProcess = require("child_process").spawn("Deploy.exe --doNotPause --colors", ["--doNotPause --colors"], {
+	if (isDeploying) {
+		mainWindow.webContents.send("frameworkDeployModalOpen", deployStartTime)
+		mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
+		return
+	}
+	isDeploying = true
+	deployOutput = ""
+	deployStartTime = Date.now()
+
+	deployProcess = require("child_process").spawn("Deploy.exe --doNotPause --colors", ["--doNotPause --colors"], {
 		shell: true,
 		cwd: ".."
 	})
 
-	let deployOutput = ""
-
-	mainWindow.webContents.send("frameworkDeployModalOpen")
+	mainWindow.webContents.send("frameworkDeployModalOpen", deployStartTime)
 
 	deployProcess.stdout.on("data", (data) => {
 		deployOutput += String(data)
@@ -149,8 +170,18 @@ ipcMain.on("deploy", () => {
 	})
 
 	deployProcess.on("close", (data) => {
+		isDeploying = false
+		deployProcess = null
+		deployStartTime = null
 		mainWindow.webContents.send("frameworkDeployFinished")
 	})
+})
+
+ipcMain.on("checkDeployStatus", () => {
+	if (isDeploying) {
+		mainWindow.webContents.send("frameworkDeployModalOpen", deployStartTime)
+		mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
+	}
 })
 
 ipcMain.on("modFileOpenDialog", () => {

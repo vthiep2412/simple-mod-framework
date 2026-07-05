@@ -34,20 +34,43 @@
 		bg: "#262626"
 	})
 
-	import { getAllMods, getConfig, mergeConfig, getManifestFromModID, modIsFramework, getModFolder, sortMods, validateModFolder, clearModsCache, clearValidationCache, preloadModsCache } from "$lib/utils"
+	import {
+		getAllMods,
+		getConfig,
+		mergeConfig,
+		getManifestFromModID,
+		modIsFramework,
+		getModFolder,
+		sortMods,
+		validateModFolder,
+		clearModsCache,
+		clearValidationCache,
+		preloadModsCache,
+		removeDirectoryRecursive
+	} from "$lib/utils"
 	import Mod from "$lib/Mod.svelte"
 	import TextInputModal from "$lib/TextInputModal.svelte"
 	import { goto } from "$app/navigation"
 
-	import Add from "carbon-icons-svelte/lib/Add.svelte"
-	import AddAlt from "carbon-icons-svelte/lib/AddAlt.svelte"
-	import SubtractAlt from "carbon-icons-svelte/lib/SubtractAlt.svelte"
-	import Rocket from "carbon-icons-svelte/lib/Rocket.svelte"
-	import Settings from "carbon-icons-svelte/lib/Settings.svelte"
-	import TrashCan from "carbon-icons-svelte/lib/TrashCan.svelte"
-	import Close from "carbon-icons-svelte/lib/Close.svelte"
-	import CloudUpload from "carbon-icons-svelte/lib/CloudUpload.svelte"
-	import Filter from "carbon-icons-svelte/lib/Filter.svelte"
+	import AddIcon from "carbon-icons-svelte/lib/Add.svelte"
+	import AddAltIcon from "carbon-icons-svelte/lib/AddAlt.svelte"
+	import SubtractAltIcon from "carbon-icons-svelte/lib/SubtractAlt.svelte"
+	import RocketIcon from "carbon-icons-svelte/lib/Rocket.svelte"
+	import SettingsIcon from "carbon-icons-svelte/lib/Settings.svelte"
+	import TrashCanIcon from "carbon-icons-svelte/lib/TrashCan.svelte"
+	import CloseIcon from "carbon-icons-svelte/lib/Close.svelte"
+	import CloudUploadIcon from "carbon-icons-svelte/lib/CloudUpload.svelte"
+	import FilterIcon from "carbon-icons-svelte/lib/Filter.svelte"
+
+	const Add = AddIcon as any
+	const AddAlt = AddAltIcon as any
+	const SubtractAlt = SubtractAltIcon as any
+	const Rocket = RocketIcon as any
+	const Settings = SettingsIcon as any
+	const TrashCan = TrashCanIcon as any
+	const Close = CloseIcon as any
+	const CloudUpload = CloudUploadIcon as any
+	const Filter = FilterIcon as any
 	import { OptionType } from "../../../../src/types"
 	import { page } from "$app/stores"
 	import SortableList from "$lib/SortableList.svelte"
@@ -60,8 +83,14 @@
 	let forceModListsUpdate = Math.random()
 
 	onMount(async () => {
-		await preloadModsCache("modList")
-		cacheLoaded = true
+		try {
+			await preloadModsCache("modList")
+		} catch (e) {
+			console.error("Failed to preload mods cache on mount:", e)
+		} finally {
+			cacheLoaded = true
+			window.ipc.send("checkDeployStatus")
+		}
 	})
 
 	$: if (cacheLoaded) {
@@ -88,7 +117,9 @@
 
 		disabledMods = getAllMods()
 			.filter((a) => !getConfig().loadOrder.includes(a))
-			.sort((a, b) => (modIsFramework(a) ? getManifestFromModID(a).name : a).localeCompare(modIsFramework(b) ? getManifestFromModID(b).name : b, undefined, { numeric: true, sensitivity: "base" }))
+			.sort((a, b) =>
+				(modIsFramework(a) ? getManifestFromModID(a).name : a).localeCompare(modIsFramework(b) ? getManifestFromModID(b).name : b, undefined, { numeric: true, sensitivity: "base" })
+			)
 			.map((a) => {
 				return { value: a, dummy: forceModListsUpdate }
 			})
@@ -104,20 +135,198 @@
 	let deployDiagnostics: string[] = []
 	let deployFinished = false
 
-	window.ipc.receive("frameworkDeployModalOpen", () => {
+	let progressPercent = 0
+	let statusLabel = "Starting deployment..."
+	let elapsedTimeStr = "0s"
+	let elapsedSeconds = 0
+	let deployTimerInterval: any = null
+	let deployWarnings: string[] = []
+	let hasError = false
+	let errorMessage = ""
+	let totalMods = 0
+	let stagedCount = 0
+
+	function startDeployTimer(deployStartTime) {
+		clearInterval(deployTimerInterval)
+		clearTimeout(autoScrollTimeout)
+		const startTime = deployStartTime || Date.now()
+		elapsedSeconds = Math.floor((Date.now() - startTime) / 1000)
+		const m = Math.floor(elapsedSeconds / 60)
+		const s = elapsedSeconds % 60
+		elapsedTimeStr = m > 0 ? `${m}m ${s}s` : `${s}s`
+
+		deployTimerInterval = setInterval(() => {
+			elapsedSeconds = Math.floor((Date.now() - startTime) / 1000)
+			const m = Math.floor(elapsedSeconds / 60)
+			const s = elapsedSeconds % 60
+			elapsedTimeStr = m > 0 ? `${m}m ${s}s` : `${s}s`
+		}, 1000)
+	}
+
+	function stopDeployTimer() {
+		clearInterval(deployTimerInterval)
+		clearTimeout(autoScrollTimeout)
+	}
+
+	function handleKeydown(event: KeyboardEvent) {
+		if (frameworkDeployModalOpen && !deployFinished && event.key === "Escape") {
+			event.preventDefault()
+			event.stopPropagation()
+		}
+	}
+
+	window.ipc.receive("frameworkDeployModalOpen", (deployStartTime) => {
 		frameworkDeployModalOpen = true
+		deployOutput = ""
+		deployOutputHTML = ""
+		deployFinished = false
+		hasError = false
+		errorMessage = ""
+		progressPercent = 0
+		statusLabel = "Starting deployment..."
+		totalMods = enabledMods.length
+		stagedCount = 0
+		startDeployTimer(deployStartTime)
 	})
 
-	const convertOutputToHTML = throttle(() => {
-		deployOutputHTML = convertAnsi.toHtml(deployOutput)
+	let wasAtBottom = true
+	let autoScrollTimeout = null
 
-		if (deployDiagnostics.length < 20) {
-			deployDiagnostics = deployOutput.split(/\r?\n/).filter((a) => a.match(/.*WARN.*?\t/) || a.match(/.*ERROR.*?\t/))
+	function handleScroll(e) {
+		const el = e.currentTarget
+		if (!el) return
+
+		const isAtBottom = el.scrollHeight - el.clientHeight - el.scrollTop < 50
+		wasAtBottom = isAtBottom
+
+		clearTimeout(autoScrollTimeout)
+		if (!isAtBottom) {
+			const delay = Math.floor(Math.random() * 10000) + 15000
+			autoScrollTimeout = setTimeout(() => {
+				wasAtBottom = true
+				const targetEl = document.getElementById("deployOutputElement")
+				if (targetEl) {
+					targetEl.scrollTop = targetEl.scrollHeight
+				}
+			}, delay)
+		}
+	}
+
+	const convertOutputToHTML = throttle(() => {
+		const el = document.getElementById("deployOutputElement")
+		if (el) {
+			wasAtBottom = el.scrollHeight - el.clientHeight - el.scrollTop < 50
+		} else {
+			wasAtBottom = true
+		}
+
+		// Parse lines for warnings and errors and deduplicate consecutive identical lines
+		const rawLines = deployOutput.split(/\r?\n/)
+		const lines: string[] = []
+		for (let i = 0; i < rawLines.length; i++) {
+			if (i === 0 || rawLines[i] !== rawLines[i - 1]) {
+				lines.push(rawLines[i])
+			}
+		}
+
+		deployOutputHTML = convertAnsi.toHtml(lines.join("\n"))
+
+		// 1. Error detection
+		const errorPatterns = [/.*ERROR.*?\t/, /Error:\s*(.*)/, /uncaughtException/, /unhandledRejection/]
+
+		let errorLine = ""
+		for (const pattern of errorPatterns) {
+			const found = lines.find((a) => a.match(pattern))
+			if (found) {
+				errorLine = found
+				break
+			}
+		}
+
+		if (errorLine) {
+			hasError = true
+			errorMessage = errorLine.replace(/.*(ERROR.*?\t|Error:\s*)/, "").trim()
+			stopDeployTimer()
+		}
+
+		// 2. Warnings parsing (unique list, no duplicates)
+		const warningsList = lines.filter((a) => a.match(/.*WARN.*?\t/)).map((a) => a.replace(/.*WARN.*?\t/, "").trim())
+		deployWarnings = [...new Set(warningsList)]
+
+		// 3. Progress tracking
+		let analyzedMods = new Set()
+		let deployedMods = new Set()
+		let currentModName = ""
+		let currentPhase = "preparing" // preparing, analyzing, deploying, finalizing
+
+		for (const line of lines) {
+			const cleanLine = line.trim()
+			const stripped = cleanLine.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, "")
+
+			const discoveringMatch = stripped.match(/Discovering mod:\s*(.*)/)
+			const analyzingMatch = stripped.match(/Analysing framework mod:\s*(.*)/)
+			const stagingMatch = stripped.match(/Staging RPKG mod:\s*(.*)/)
+			const deployingMatch = stripped.match(/Deploying\s*(.*)/)
+			const writingMatch = stripped.match(/(Writing packagedefinition|Writing chunk|Generating ORES|Rebuilding)/)
+
+			if (discoveringMatch) {
+				currentPhase = "preparing"
+				currentModName = discoveringMatch[1].trim()
+			} else if (analyzingMatch) {
+				currentPhase = "analyzing"
+				const modName = analyzingMatch[1].trim()
+				analyzedMods.add(modName)
+				currentModName = modName
+			} else if (stagingMatch) {
+				currentPhase = "deploying"
+				const modName = stagingMatch[1].trim()
+				deployedMods.add(modName)
+				currentModName = modName
+			} else if (deployingMatch) {
+				currentPhase = "deploying"
+				const modName = deployingMatch[1].trim()
+				deployedMods.add(modName)
+				currentModName = modName
+			} else if (writingMatch) {
+				currentPhase = "finalizing"
+			}
+		}
+
+		totalMods = enabledMods.length
+		stagedCount = deployedMods.size
+
+		if (hasError) {
+			// Stay in error state
+		} else if (deployFinished) {
+			progressPercent = 100
+			statusLabel = "Deployment completed successfully!"
+		} else if (totalMods > 0) {
+			if (currentPhase === "preparing") {
+				progressPercent = Math.min(10, Math.round((lines.length / 50) * 10))
+				statusLabel = `Preparing deployment... (${currentModName})`
+			} else if (currentPhase === "analyzing") {
+				const fraction = totalMods > 0 ? analyzedMods.size / totalMods : 0
+				progressPercent = Math.round(10 + fraction * 30)
+				statusLabel = `Analyzing mod: ${currentModName} (${analyzedMods.size}/${totalMods})`
+			} else if (currentPhase === "deploying") {
+				const fraction = totalMods > 0 ? deployedMods.size / totalMods : 0
+				progressPercent = Math.round(40 + fraction * 50)
+				statusLabel = `Deploying mod: ${currentModName} (${deployedMods.size}/${totalMods})`
+			} else if (currentPhase === "finalizing") {
+				progressPercent = 95
+				statusLabel = "Finalizing deployment..."
+			}
+		} else {
+			progressPercent = 0
+			statusLabel = "Preparing deployment..."
 		}
 
 		setTimeout(() => {
-			document.getElementById("deployOutputElement")?.children[0].scrollIntoView(false)
-		}, 100)
+			const el = document.getElementById("deployOutputElement")
+			if (el && wasAtBottom) {
+				el.scrollTop = el.scrollHeight
+			}
+		}, 50)
 	}, 500)
 
 	window.ipc.receive("frameworkDeployOutput", (output: string) => {
@@ -127,6 +336,33 @@
 
 	window.ipc.receive("frameworkDeployFinished", () => {
 		deployFinished = true
+		stopDeployTimer()
+
+		const lines = deployOutput.split(/\r?\n/).map((a) => a.trim())
+		const succeeded = lines.some((a) => a.includes("Done in"))
+
+		if (succeeded && !hasError) {
+			progressPercent = 100
+			statusLabel = "Deployment completed successfully!"
+		} else {
+			hasError = true
+			statusLabel = "Deployment failed"
+
+			// Kill rpkg-cli to prevent process leak
+			try {
+				window.child_process.execSync("taskkill /f /im rpkg-cli.exe")
+			} catch (e: any) {
+				// Ignore ENOENT errors (file not found, process already killed)
+				if (e.code !== "ENOENT") {
+					console.error("Error killing rpkg-cli:", e)
+				}
+			}
+
+			if (!errorMessage) {
+				const lastErrorLine = [...lines].reverse().find((a) => a.includes("Error:") || a.includes("ERROR") || a.includes("uncaughtException"))
+				errorMessage = lastErrorLine ? lastErrorLine.replace(/.*(ERROR.*?\t|Error:\s*)/, "").trim() : "The deployment process terminated unexpectedly."
+			}
+		}
 	})
 
 	document.addEventListener("drop", (event) => {
@@ -152,6 +388,7 @@
 	let bulkImportModalOpen = false
 	let stageInProgress = false
 	let currentStagingRunId = 0
+	let activeStagingProcess: any = null
 	let stagedMods: Array<{
 		id: string
 		fileName: string
@@ -173,7 +410,8 @@
 
 	function execFileAsync(file: string, args: string[]): Promise<string> {
 		return new Promise((resolve, reject) => {
-			window.child_process.execFile(file, args, (error: any, stdout: any, stderr: any) => {
+			activeStagingProcess = window.child_process.execFile(file, args, (error: any, stdout: any, stderr: any) => {
+				activeStagingProcess = null
 				if (error) {
 					reject(error)
 				} else {
@@ -184,8 +422,8 @@
 	}
 
 	function sanitizeModName(name: string): string {
-		let sanitized = name.replace(/[/\\]/g, "")
-		sanitized = sanitized.replace(/\.\./g, "")
+		let sanitized = name.replace(/[<>:"/\\|?*]/g, "")
+		sanitized = sanitized.replace(/^\.+$/, "")
 		sanitized = sanitized.trim()
 		if (!sanitized) {
 			sanitized = "staged_rpkg_mod"
@@ -194,6 +432,14 @@
 	}
 
 	async function stageFiles(filePaths: string[]) {
+		if (activeStagingProcess) {
+			try {
+				activeStagingProcess.kill()
+			} catch (e) {
+				console.error("Failed to kill previous staging process:", e)
+			}
+			activeStagingProcess = null
+		}
 		stageInProgress = true
 		bulkImportModalOpen = true
 		stagedMods = []
@@ -225,135 +471,143 @@
 					type = "rpkg"
 					status = "valid"
 					let chunk = "chunk0"
-					let result = [...filePath.matchAll(/(chunk[0-9]*)/g)]
+					const fileName = window.path.basename(filePath)
+					let result = [...fileName.matchAll(/(chunk[0-9]*)/g)]
 					if (result.length) {
 						chunk = result[0][1]
 					}
 					const destChunkDir = window.path.join(stageDir, chunk)
 					window.fs.ensureDirSync(destChunkDir)
 					window.fs.copyFileSync(filePath, window.path.join(destChunkDir, fileName))
-					
+
 					const cleanName = fileName.replace(/\.rpkg$/i, "")
 					rpkgNameInput = cleanName
-					mods = [{
-						id: cleanName,
-						name: cleanName,
-						folder: stageDir,
-						isFramework: false,
-						rpkgs: [{ path: window.path.join(destChunkDir, fileName), chunk }]
-					}]
+					mods = [
+						{
+							id: cleanName,
+							name: cleanName,
+							folder: stageDir,
+							isFramework: false,
+							rpkgs: [{ path: window.path.join(destChunkDir, fileName), chunk }]
+						}
+					]
 				} else {
-				try {
-					await execFileAsync("..\\Third-Party\\7z.exe", ["x", filePath, "-aoa", "-y", `-o${stageDir}`])
-					if (runId !== currentStagingRunId) {
-						return
-					}
-					
-					const rootFiles = window.fs.readdirSync(stageDir)
-					const hasFilesAtRoot = window.klaw(stageDir, { depthLimit: 0, nodir: true }).length > 0
-					const everySubdirHasManifest = rootFiles.length > 0 && rootFiles.every(a => {
-						const fullSubPath = window.path.join(stageDir, a)
-						if (!window.isFile(fullSubPath)) {
-							return window.fs.existsSync(window.path.join(fullSubPath, "manifest.json"))
+					try {
+						await execFileAsync("..\\Third-Party\\7z.exe", ["x", filePath, "-aoa", "-y", `-o${stageDir}`])
+						if (runId !== currentStagingRunId) {
+							return
 						}
-						return false
-					})
 
-					if (everySubdirHasManifest && !hasFilesAtRoot) {
-						type = "framework"
-						for (const a of rootFiles) {
-							const modFolder = window.path.join(stageDir, a)
-							let manifest: any
-							try {
-								manifest = json5.parse(window.fs.readFileSync(window.path.join(modFolder, "manifest.json"), "utf8"))
-							} catch (e) {
-								status = "invalid"
-								errors.push(`Invalid manifest.json syntax in folder "${a}"`)
-								continue
-							}
+						const rootFiles = window.fs.readdirSync(stageDir)
+						const hasFilesAtRoot = window.klaw(stageDir, { depthLimit: 0, nodir: true }).length > 0
+						const everySubdirHasManifest =
+							rootFiles.length > 0 &&
+							rootFiles.every((a) => {
+								const fullSubPath = window.path.join(stageDir, a)
+								if (!window.isFile(fullSubPath)) {
+									return window.fs.existsSync(window.path.join(fullSubPath, "manifest.json"))
+								}
+								return false
+							})
 
-							const modValidation = validateModFolder(modFolder)
-							if (!modValidation[0]) {
-								status = "invalid"
-								errors.push(`Validation failed for "${manifest.name || a}": ${modValidation[1]}`)
-							} else {
-								let modWarning = ""
-								if (manifest.scripts || manifest.options?.some((b: any) => b.scripts)) {
-									modWarning = "Contains custom scripts"
+						if (everySubdirHasManifest && !hasFilesAtRoot) {
+							type = "framework"
+							for (const a of rootFiles) {
+								const modFolder = window.path.join(stageDir, a)
+								let manifest: any
+								try {
+									manifest = json5.parse(window.fs.readFileSync(window.path.join(modFolder, "manifest.json"), "utf8"))
+								} catch (e) {
+									status = "invalid"
+									errors.push(`Invalid manifest.json syntax in folder "${a}"`)
+									continue
 								}
-								if (manifest.peacockPlugins || manifest.options?.some((b: any) => b.peacockPlugins)) {
-									if (modWarning) modWarning += ", and peacock plugins"
-									else modWarning = "Contains peacock plugins"
-								}
-								if (modWarning) {
-									if (status !== "invalid") {
-										status = "warning"
+
+								const modValidation = validateModFolder(modFolder)
+								if (!modValidation[0]) {
+									status = "invalid"
+									errors.push(`Validation failed for "${manifest.name || a}": ${modValidation[1]}`)
+								} else {
+									let modWarning = ""
+									if (manifest.scripts || manifest.options?.some((b: any) => b.scripts)) {
+										modWarning = "Contains custom scripts"
 									}
-									warnings.push(`${manifest.name || a}: ${modWarning}`)
+									if (manifest.peacockPlugins || manifest.options?.some((b: any) => b.peacockPlugins)) {
+										if (modWarning) modWarning += ", and peacock plugins"
+										else modWarning = "Contains peacock plugins"
+									}
+									if (modWarning) {
+										if (status !== "invalid") {
+											status = "warning"
+										}
+										warnings.push(`${manifest.name || a}: ${modWarning}`)
+									}
+									mods.push({
+										id: manifest.id,
+										name: manifest.name,
+										folder: modFolder,
+										isFramework: true
+									})
 								}
-								mods.push({
-									id: manifest.id,
-									name: manifest.name,
-									folder: modFolder,
-									isFramework: true
-								})
 							}
-						}
-					} else {
-						const stagingFileList = window.klaw(stageDir, { nodir: true })
-						const rpkgFiles = stagingFileList.filter(a => a.path.toLowerCase().endsWith(".rpkg"))
-						if (rpkgFiles.length > 0) {
-							type = "rpkg"
-							if (status !== "invalid") {
-								status = "valid"
-							}
-							const cleanName = fileName.replace(/\.(zip|7z|rar)$/i, "")
-							rpkgNameInput = cleanName
-							
-							const rpkgsToInstall: any[] = []
-							for (const file of rpkgFiles) {
-								let chunk = "chunk0"
-								let result = [...file.path.matchAll(/(chunk[0-9]*)/g)]
-								if (result.length) {
-									chunk = result[0][1]
-								}
-								rpkgsToInstall.push({ path: file.path, chunk })
-							}
-							
-							mods = [{
-								id: cleanName,
-								name: cleanName,
-								folder: stageDir,
-								isFramework: false,
-								rpkgs: rpkgsToInstall
-							}]
 						} else {
-							type = "unknown"
-							status = "invalid"
-							errors.push("No manifest.json or .rpkg files found in archive")
-						}
-					}
-				} catch (err: any) {
-					status = "invalid"
-					errors.push(`Extraction/Analysis failed: ${err.message || err}`)
-				}
-			}
+							const stagingFileList = window.klaw(stageDir, { nodir: true })
+							const rpkgFiles = stagingFileList.filter((a) => a.path.toLowerCase().endsWith(".rpkg"))
+							if (rpkgFiles.length > 0) {
+								type = "rpkg"
+								if ((status as string) !== "invalid") {
+									status = "valid"
+								}
+								const cleanName = fileName.replace(/\.(zip|7z|rar)$/i, "")
+								rpkgNameInput = cleanName
 
-			if (runId !== currentStagingRunId) {
-				return
-			}
-			stagedMods.push({
-				id: `staged_${Date.now()}_${i}`,
-				fileName,
-				filePath,
-				stageDir,
-				type,
-				status,
-				errors,
-				warnings,
-				mods,
-				rpkgNameInput
-			})
+								const rpkgsToInstall: any[] = []
+								for (const file of rpkgFiles) {
+									let chunk = "chunk0"
+									const relPath = window.path.relative(stageDir, file.path)
+									let result = [...relPath.matchAll(/(chunk[0-9]*)/g)]
+									if (result.length) {
+										chunk = result[0][1]
+									}
+									rpkgsToInstall.push({ path: file.path, chunk })
+								}
+
+								mods = [
+									{
+										id: cleanName,
+										name: cleanName,
+										folder: stageDir,
+										isFramework: false,
+										rpkgs: rpkgsToInstall
+									}
+								]
+							} else {
+								type = "unknown"
+								status = "invalid"
+								errors.push("No manifest.json or .rpkg files found in archive")
+							}
+						}
+					} catch (err: any) {
+						status = "invalid"
+						errors.push(`Extraction/Analysis failed: ${err.message || err}`)
+					}
+				}
+
+				if (runId !== currentStagingRunId) {
+					return
+				}
+				stagedMods.push({
+					id: `staged_${Date.now()}_${i}`,
+					fileName,
+					filePath,
+					stageDir,
+					type,
+					status,
+					errors,
+					warnings,
+					mods,
+					rpkgNameInput
+				})
 			}
 			if (runId !== currentStagingRunId) {
 				return
@@ -371,9 +625,10 @@
 		for (const staged of modsToImport) {
 			if (staged.type === "framework") {
 				for (const mod of staged.mods) {
-					const destFolder = window.path.join("..", "Mods", window.path.basename(mod.folder))
+					const existingFolder = foldersMap.get(mod.id)
+					const destFolder = existingFolder || window.path.join("..", "Mods", mod.id)
 					if (window.fs.existsSync(destFolder)) {
-						existingNames.push(window.path.basename(mod.folder))
+						existingNames.push(mod.name || mod.id)
 					}
 				}
 			} else if (staged.type === "rpkg") {
@@ -396,7 +651,11 @@
 		for (const staged of modsToImport) {
 			if (staged.type === "framework") {
 				for (const mod of staged.mods) {
-					const destFolder = window.path.join("..", "Mods", window.path.basename(mod.folder))
+					const existingFolder = foldersMap.get(mod.id)
+					const destFolder = existingFolder || window.path.join("..", "Mods", mod.id)
+					if (window.fs.existsSync(destFolder)) {
+						window.fs.removeSync(destFolder)
+					}
 					window.fs.copySync(mod.folder, destFolder)
 
 					if (!getConfig().knownMods.includes(mod.id)) {
@@ -408,7 +667,11 @@
 			} else if (staged.type === "rpkg") {
 				const rawName = staged.rpkgNameInput ? staged.rpkgNameInput.trim() : staged.fileName.replace(/\.[^/.]+$/, "")
 				const modName = sanitizeModName(rawName)
-				
+				const destFolder = window.path.join("..", "Mods", modName)
+				if (window.fs.existsSync(destFolder)) {
+					window.fs.removeSync(destFolder)
+				}
+
 				for (const mod of staged.mods) {
 					if (mod.rpkgs) {
 						for (const file of mod.rpkgs) {
@@ -432,10 +695,10 @@
 		} catch (e) {
 			// ignore cleanup errors
 		}
-		
+
 		clearModsCache()
 		clearValidationCache()
-		
+
 		forceModListsUpdate = Math.random()
 		changed = true
 
@@ -460,6 +723,14 @@
 
 	function cancelBulkImport() {
 		currentStagingRunId++
+		if (activeStagingProcess) {
+			try {
+				activeStagingProcess.kill()
+			} catch (e) {
+				console.error("Failed to kill staging process on cancel:", e)
+			}
+			activeStagingProcess = null
+		}
 		for (const staged of stagedMods) {
 			try {
 				window.fs.removeSync(staged.stageDir)
@@ -506,9 +777,23 @@
 	let autoInstallModName = ""
 	let autoInstallModalOpen = false
 
+	const trustedHosts = new Set(["github.com", "raw.githubusercontent.com", "dropbox.com", "dl.dropboxusercontent.com", "drive.google.com", "hitman-resources.netlify.app"])
+
 	$: if ($page.url.searchParams.get("urlScheme")) {
 		;(async () => {
 			let chunksAll
+
+			try {
+				const downloadUrl = $page.url.searchParams.get("urlScheme")!
+				const url = new URL(downloadUrl)
+				if (!(trustedHosts.has(url.hostname) || url.hostname.split(".").slice(-2).join(".") === "github.io")) {
+					window.alert("Security error: Untrusted host for mod download: " + url.hostname)
+					return
+				}
+			} catch (err) {
+				window.alert("Security error: Invalid download URL")
+				return
+			}
 
 			try {
 				autoInstallDownloading = true
@@ -565,400 +850,427 @@
 	}
 </script>
 
+<svelte:window on:keydown={handleKeydown} />
+
 {#if !cacheLoaded}
 	<div class="flex flex-col items-center justify-center h-full w-full gap-4">
 		<InlineLoading description="Loading mods cache..." />
 	</div>
 {:else}
-<div class="grid grid-cols-2 gap-4 w-full mb-16">
-	<div class="w-full">
-		<div class="flex gap-4 items-center justify-center" transition:scale>
-			<h1 class="flex-grow">Available Mods</h1>
-			<div>
-				<Search icon={Filter} placeholder="Filter available mods" bind:value={availableModFilter} />
+	<div class="grid grid-cols-2 gap-4 w-full mb-16">
+		<div class="w-full">
+			<div class="flex gap-4 items-center justify-center" transition:scale>
+				<h1 class="flex-grow">Available Mods</h1>
+				<div>
+					<Search icon={Filter} placeholder="Filter available mods" bind:value={availableModFilter} />
+				</div>
+				<Button
+					kind="primary"
+					icon={Add}
+					on:click={() => {
+						openAddModDialog()
+					}}
+				>
+					Add a Mod
+				</Button>
 			</div>
-			<Button
-				kind="primary"
-				icon={Add}
-				on:click={() => {
-					openAddModDialog()
-				}}
-			>
-				Add a Mod
-			</Button>
+			<br />
+			<div class="h-[90vh] overflow-y-auto">
+				{#each disabledMods.filter( (a) => ((modIsFramework(a.value) ? getManifestFromModID(a.value).name : a.value) + (modIsFramework(a.value) ? getManifestFromModID(a.value).description : ""))
+							.toLowerCase()
+							.includes(availableModFilter.toLowerCase()) ) as item (item.value)}
+					<div animate:flip={{ duration: 300 }}>
+						<div transition:scale>
+							<Mod
+								isFrameworkMod={modIsFramework(item.value)}
+								manifest={modIsFramework(item.value) ? getManifestFromModID(item.value) : undefined}
+								rpkgModName={!modIsFramework(item.value) ? item.value : undefined}
+							>
+								<Button
+									kind="primary"
+									icon={AddAlt}
+									on:click={() => {
+										mergeConfig({
+											loadOrder: [...getConfig().loadOrder, item.value]
+										})
+										changed = true
+										forceModListsUpdate = Math.random()
+									}}
+								>
+									Enable
+								</Button>
+								<Button
+									kind="danger"
+									icon={TrashCan}
+									on:click={() => {
+										deleteModInProgress = item.value
+										deleteModModalOpen = true
+									}}
+								>
+									Delete
+								</Button>
+							</Mod>
+						</div>
+						<br />
+					</div>
+				{/each}
+			</div>
 		</div>
-		<br />
-		<div class="h-[90vh] overflow-y-auto">
-			{#each disabledMods.filter((a) => ((modIsFramework(a.value) ? getManifestFromModID(a.value).name : a.value) + (modIsFramework(a.value) ? getManifestFromModID(a.value).description : ""))
-					.toLowerCase()
-					.includes(availableModFilter.toLowerCase())) as item (item.value)}
-				<div animate:flip={{ duration: 300 }}>
-					<div transition:scale>
+		<div class="w-full">
+			<div class="flex gap-4 items-center justify-center" transition:scale>
+				<h1 class="flex-grow">{changed && !deployFinished ? "To Be Applied" : "Enabled Mods"}</h1>
+				<div>
+					<Search icon={Filter} placeholder="Filter enabled mods" bind:value={enabledModFilter} />
+				</div>
+				<Button
+					kind="primary"
+					{...{ style: changed && !deployFinished ? "background-color: green" : "" }}
+					icon={Rocket}
+					on:click={() => {
+						if (sortMods()) {
+							deployOutput = ""
+							deployOutputHTML = ""
+							deployFinished = false
+							window.ipc.send("deploy")
+						} else {
+							dependencyCycleModalOpen = true
+						}
+					}}
+				>
+					Apply
+				</Button>
+			</div>
+			<br />
+			<div class="h-[90vh] overflow-y-auto">
+				<SortableList list={enabledMods} key="value" on:sort={handleSort} let:item>
+					<div class="cursor-grab">
 						<Mod
 							isFrameworkMod={modIsFramework(item.value)}
 							manifest={modIsFramework(item.value) ? getManifestFromModID(item.value) : undefined}
 							rpkgModName={!modIsFramework(item.value) ? item.value : undefined}
+							darken={!(
+								(modIsFramework(item.value) ? getManifestFromModID(item.value).name : item.value) + (modIsFramework(item.value) ? getManifestFromModID(item.value).description : "")
+							)
+								.toLowerCase()
+								.includes(enabledModFilter.toLowerCase())}
 						>
+							{#if modIsFramework(item.value) && getManifestFromModID(item.value)?.options?.filter((a) => a.type != OptionType.conditional)?.length}
+								<Button
+									kind="ghost"
+									icon={Settings}
+									iconDescription="Adjust this mod's settings"
+									on:click={() => {
+										goto(`/settings?mod=${getManifestFromModID(item.value).id}`)
+									}}
+								/>
+							{/if}
 							<Button
-								kind="primary"
-								icon={AddAlt}
+								kind="danger"
+								icon={SubtractAlt}
 								on:click={() => {
 									mergeConfig({
-										loadOrder: [...getConfig().loadOrder, item.value]
+										loadOrder: getConfig().loadOrder.filter((a) => a != item.value)
 									})
 									changed = true
 									forceModListsUpdate = Math.random()
 								}}
 							>
-								Enable
-							</Button>
-							<Button
-								kind="danger"
-								icon={TrashCan}
-								on:click={() => {
-									deleteModInProgress = item.value
-									deleteModModalOpen = true
-								}}
-							>
-								Delete
+								Disable
 							</Button>
 						</Mod>
+						<br />
 					</div>
-					<br />
-				</div>
-			{/each}
-		</div>
-	</div>
-	<div class="w-full">
-		<div class="flex gap-4 items-center justify-center" transition:scale>
-			<h1 class="flex-grow">{changed && !deployFinished ? "To Be Applied" : "Enabled Mods"}</h1>
-			<div>
-				<Search icon={Filter} placeholder="Filter enabled mods" bind:value={enabledModFilter} />
+				</SortableList>
 			</div>
-			<Button
-				kind="primary"
-				style={changed && !deployFinished ? "background-color: green" : ""}
-				icon={Rocket}
-				on:click={() => {
-					if (sortMods()) {
-						deployOutput = ""
-						deployOutputHTML = ""
-						deployFinished = false
-						window.ipc.send("deploy")
-					} else {
-						dependencyCycleModalOpen = true
-					}
-				}}
-			>
-				Apply
-			</Button>
-		</div>
-		<br />
-		<div class="h-[90vh] overflow-y-auto">
-			<SortableList
-				list={enabledMods}
-				key="value"
-				on:sort={handleSort}
-				let:item
-			>
-				<div class="cursor-grab">
-					<Mod
-						isFrameworkMod={modIsFramework(item.value)}
-						manifest={modIsFramework(item.value) ? getManifestFromModID(item.value) : undefined}
-						rpkgModName={!modIsFramework(item.value) ? item.value : undefined}
-						darken={!((modIsFramework(item.value) ? getManifestFromModID(item.value).name : item.value) + (modIsFramework(item.value) ? getManifestFromModID(item.value).description : ""))
-							.toLowerCase()
-							.includes(enabledModFilter.toLowerCase())}
-					>
-						{#if modIsFramework(item.value) && getManifestFromModID(item.value)?.options?.filter((a) => a.type != OptionType.conditional)?.length}
-							<Button
-								kind="ghost"
-								icon={Settings}
-								iconDescription="Adjust this mod's settings"
-								on:click={() => {
-									goto(`/settings?mod=${getManifestFromModID(item.value).id}`)
-								}}
-							/>
-						{/if}
-						<Button
-							kind="danger"
-							icon={SubtractAlt}
-							on:click={() => {
-								mergeConfig({
-									loadOrder: getConfig().loadOrder.filter((a) => a != item.value)
-								})
-								changed = true
-								forceModListsUpdate = Math.random()
-							}}
-						>
-							Disable
-						</Button>
-					</Mod>
-					<br />
-				</div>
-			</SortableList>
 		</div>
 	</div>
-</div>
 
-{#if showDropHint}
-	<div transition:fade={{ duration: 100 }} class="w-screen h-screen absolute top-0 left-0 bg-black/90 flex flex-col gap-4 justify-center items-center">
-		<h1 class="font-bold">Drop to install</h1>
-	</div>
-{/if}
-
-<Modal
-	danger
-	bind:open={deleteModModalOpen}
-	modalHeading="Delete mod"
-	primaryButtonText="Delete the mod"
-	secondaryButtonText="Cancel"
-	on:click:button--secondary={() => (deleteModModalOpen = false)}
-	on:submit={() => {
-		window.fs.removeSync(getModFolder(deleteModInProgress))
-		mergeConfig({ knownMods: getConfig().knownMods.filter((a) => a != deleteModInProgress) })
-
-		clearModsCache()
-		clearValidationCache()
-		forceModListsUpdate = Math.random()
-		changed = true
-		deleteModModalOpen = false
-	}}
-	shouldSubmitOnEnter={false}
->
-	<p>
-		{#if deleteModInProgress}
-			Are you sure you want to permanently remove the <i>{modIsFramework(deleteModInProgress) ? getManifestFromModID(deleteModInProgress).name : deleteModInProgress}</i>
-			mod from the Mods folder? You cannot undo this.
-		{/if}
-	</p>
-</Modal>
-
-<Modal alert bind:open={dependencyCycleModalOpen} modalHeading="Dependency cycle (couldn't sort mods)" primaryButtonText="OK" shouldSubmitOnEnter={false}>
-	<p>The framework couldn't sort your mods! Ask the developer of whichever mod you most recently installed to investigate this. Also, report this to Atampy26 on Hitman Forum or Discord.</p>
-</Modal>
-
-<Modal passiveModal open={frameworkDeployModalOpen} modalHeading="Applying your mods" preventCloseOnClickOutside>
-	Your mods are being deployed. This may take a while - grab a coffee or something.
-	<br />
-	<pre
-		class="mt-2 h-[10vh] overflow-y-auto whitespace-pre-wrap bg-neutral-800 p-2"
-		style="font-family: 'Fira Code', 'IBM Plex Mono', 'Menlo', 'DejaVu Sans Mono', 'Bitstream Vera Sans Mono', Courier, monospace; color-scheme: dark"
-		id="deployOutputElement">{@html deployOutputHTML}</pre>
-	{#if deployOutput.split(/\r?\n/).some((a) => a.match(/.*WARN.*?\t/)) || deployOutput.split(/\r?\n/).some((a) => a.match(/.*ERROR.*?\t/))}
-		<br />
-		<div class="flex flex-row gap-2 flex-wrap max-h-[15vh] overflow-y-auto">
-			{#each deployDiagnostics as line}
-				<InlineNotification hideCloseButton lowContrast kind={line.includes("WARN") ? "warning" : "error"}>
-					<div slot="title" class="-mt-1 text-lg">
-						{line.includes("WARN") ? "Warning" : "Error"}
-					</div>
-					<div slot="subtitle">{line.replace(/.*WARN.*?\t/, "").replace(/.*ERROR.*?\t/, "")}</div>
-				</InlineNotification>
-			{/each}
+	{#if showDropHint}
+		<div transition:fade={{ duration: 100 }} class="w-screen h-screen absolute top-0 left-0 bg-black/90 flex flex-col gap-4 justify-center items-center">
+			<h1 class="font-bold">Drop to install</h1>
 		</div>
 	{/if}
 
-	{#if deployFinished}
-		<br />
-		<div class="flex gap-4 items-center">
-			{#if deployOutput
-				.split(/\r?\n/)
-				.map((a) => a.trim())
-				.filter((a) => a.length)
-				.at(-1)
-				.match(/\tDone in .*/) && !deployOutput.split(/\r?\n/).some((a) => a.match(/.*WARN.*?\t/))}
-				<Button kind="primary" icon={Close} on:click={() => (frameworkDeployModalOpen = false)}>Close</Button>
-				<span class="text-green-300">Deploy successful</span>
-			{:else if deployOutput
-				.split(/\r?\n/)
-				.map((a) => a.trim())
-				.filter((a) => a.length)
-				.at(-1)
-				.match(/\tDone in .*/) && deployOutput.split(/\r?\n/).some((a) => a.match(/.*WARN.*?\t/))}
-				<Button kind="primary" icon={Close} on:click={() => (frameworkDeployModalOpen = false)}>Close</Button>
-				<span class="text-yellow-300">Potential issues in deployment</span>
-			{:else}
-				<Button kind="primary" icon={Close} on:click={() => (frameworkDeployModalOpen = false)}>Close</Button>
-				<Button
-					kind="primary"
-					icon={CloudUpload}
-					on:click={async () => {
-						const req = await fetch("http://hitman-resources.netlify.app/.netlify/functions/upload-smf-log", {
-							method: "POST",
-							headers: {
-								"Content-Type": "application/json"
-							},
-							body: JSON.stringify({ content: "Config:\n" + JSON.stringify(getConfig()) + "\n\nDeploy log:\n" + deployOutput })
-						})
+	<Modal
+		danger
+		bind:open={deleteModModalOpen}
+		modalHeading="Delete mod"
+		primaryButtonText="Delete the mod"
+		secondaryButtonText="Cancel"
+		on:click:button--secondary={() => (deleteModModalOpen = false)}
+		on:submit={async () => {
+			await removeDirectoryRecursive(getModFolder(deleteModInProgress))
+			mergeConfig({ knownMods: getConfig().knownMods.filter((a) => a != deleteModInProgress) })
 
-						if (req.status == 200) {
-							uploadedLogURL = await req.text()
+			clearModsCache()
+			clearValidationCache()
+			forceModListsUpdate = Math.random()
+			changed = true
+			deleteModModalOpen = false
+		}}
+		shouldSubmitOnEnter={false}
+	>
+		<p>
+			{#if deleteModInProgress}
+				Are you sure you want to permanently remove the <i>{modIsFramework(deleteModInProgress) ? getManifestFromModID(deleteModInProgress).name : deleteModInProgress}</i>
+				mod from the Mods folder? You cannot undo this.
+			{/if}
+		</p>
+	</Modal>
 
-							frameworkDeployModalOpen = false
-							uploadLogModalOpen = true
-						} else {
-							uploadLogFailedModalOpen = true
-						}
-					}}
+	<Modal alert bind:open={dependencyCycleModalOpen} modalHeading="Dependency cycle (couldn't sort mods)" primaryButtonText="OK" shouldSubmitOnEnter={false}>
+		<p>The framework couldn't sort your mods! Ask the developer of whichever mod you most recently installed to investigate this. Also, report this to Atampy26 on Hitman Forum or Discord.</p>
+	</Modal>
+
+	<Modal passiveModal open={frameworkDeployModalOpen} modalHeading="Applying your mods" preventCloseOnClickOutside>
+		{#if hasError}
+			<div class="mb-4">
+				<InlineNotification hideCloseButton lowContrast kind="error" title="Deployment Failed" subtitle={errorMessage} style="max-width: none; width: 100%;" />
+			</div>
+		{/if}
+
+		<div class="bx--progress-bar mb-4">
+			{#if !hasError}
+				<div class="flex justify-between items-center mb-1 text-sm text-gray-200">
+					<span>{statusLabel}</span>
+					<span class="font-mono font-bold" style="color: {hasError ? '#da1e28' : '#0f62fe'};">{progressPercent}%</span>
+				</div>
+				<div class="bx--progress-bar__track" style="height: 8px;">
+					<div
+						class="bx--progress-bar__bar"
+						style="transform: scaleX({progressPercent / 100}); transform-origin: left; transition: transform 0.3s ease-out; background-color: {hasError ? '#da1e28' : '#0f62fe'};"
+					></div>
+				</div>
+			{/if}
+			<div class="bx--progress-bar__helper-text mt-1 text-xs text-gray-400 font-mono flex justify-between">
+				{#if hasError}
+					<span class="text-red-400 font-bold">Failed in {elapsedTimeStr}</span>
+				{:else if deployFinished}
+					<span class="text-green-400 font-bold">Done in {elapsedTimeStr}</span>
+				{:else}
+					<span>Elapsed time: {elapsedTimeStr}</span>
+				{/if}
+			</div>
+		</div>
+
+		<div class="flex gap-4 mt-2 items-stretch">
+			<pre
+				class="flex-1 min-h-[25vh] max-h-[35vh] overflow-y-auto whitespace-pre-wrap bg-neutral-800 p-2 border border-neutral-700/30 rounded-sm"
+				style="font-family: 'Fira Code', 'IBM Plex Mono', 'Menlo', 'DejaVu Sans Mono', 'Bitstream Vera Sans Mono', Courier, monospace; color-scheme: dark; font-size: 0.75rem;"
+				id="deployOutputElement"
+				on:scroll={handleScroll}>{@html deployOutputHTML}</pre>
+
+			{#if deployWarnings.length > 0}
+				<div
+					class="w-[240px] min-h-[25vh] max-h-[35vh] overflow-y-auto bg-neutral-800 p-2 border border-yellow-600/40 rounded-sm text-yellow-300 text-xs flex flex-col gap-1"
+					style="font-family: 'Fira Code', 'IBM Plex Mono', monospace; color-scheme: dark;"
 				>
-					Upload mod list and log
-				</Button>
-				<span class="text-red-300">Deploy unsuccessful</span>
+					<div class="font-bold border-b border-yellow-600/30 pb-1 mb-1 sticky top-0 bg-neutral-800 z-10">Warnings</div>
+					{#each deployWarnings as warning}
+						<div class="py-1 border-b border-neutral-700/50 break-words leading-relaxed">{warning}</div>
+					{/each}
+				</div>
 			{/if}
 		</div>
-	{/if}
-</Modal>
 
-<Modal
-	open={bulkImportModalOpen}
-	modalHeading="Staged Mods for Import"
-	primaryButtonText="Import Valid Mods"
-	secondaryButtonText="Cancel"
-	primaryButtonDisabled={stagedMods.filter(sm => sm.status !== "invalid").length === 0}
-	on:click:button--primary={executeBulkImport}
-	on:click:button--secondary={cancelBulkImport}
-	on:close={cancelBulkImport}
->
-	<div class="mt-4 max-h-[50vh] overflow-y-auto overflow-x-hidden pr-2">
-		{#if stageInProgress}
-			<div class="flex flex-col items-center justify-center py-8">
-				<ProgressBar helperText="Analyzing and staging mods..." />
-			</div>
-		{:else}
-			<div class="flex flex-col gap-4">
-				{#each stagedMods as item (item.id)}
-					<div class="flex flex-col gap-2 rounded bg-neutral-800 p-4 border border-neutral-700">
-						<div class="flex items-center justify-between gap-4">
-							<div class="flex flex-col min-w-0">
-								<span class="font-bold text-white truncate text-[1rem]">{item.fileName}</span>
-								<span class="text-xs text-neutral-400 truncate">{item.filePath}</span>
-							</div>
-							<div class="flex items-center gap-2 flex-shrink-0">
-								{#if item.type === "framework"}
-									<span class="px-2 py-0.5 rounded text-xs font-semibold bg-blue-900 text-blue-200">Framework Mod</span>
-								{:else if item.type === "rpkg"}
-									<span class="px-2 py-0.5 rounded text-xs font-semibold bg-purple-900 text-purple-200">RPKG Mod</span>
-								{:else}
-									<span class="px-2 py-0.5 rounded text-xs font-semibold bg-neutral-700 text-neutral-300">Unknown</span>
-								{/if}
+		{#if deployFinished}
+			<br />
+			<div class="flex gap-4 items-center">
+				{#if deployOutput
+					.split(/\r?\n/)
+					.map((a) => a.trim())
+					.filter((a) => a.length)
+					.at(-1)
+					?.match(/\tDone in .*/) && !deployOutput.split(/\r?\n/).some((a) => a.match(/.*WARN.*?\t/))}
+					<Button kind="primary" icon={Close} on:click={() => (frameworkDeployModalOpen = false)}>Close</Button>
+					<span class="text-green-300">Deploy successful</span>
+				{:else if deployOutput
+					.split(/\r?\n/)
+					.map((a) => a.trim())
+					.filter((a) => a.length)
+					.at(-1)
+					?.match(/\tDone in .*/) && deployOutput.split(/\r?\n/).some((a) => a.match(/.*WARN.*?\t/))}
+					<Button kind="primary" icon={Close} on:click={() => (frameworkDeployModalOpen = false)}>Close</Button>
+					<span class="text-yellow-300">Potential issues in deployment</span>
+				{:else}
+					<Button kind="primary" icon={Close} on:click={() => (frameworkDeployModalOpen = false)}>Close</Button>
+					<Button
+						kind="primary"
+						icon={CloudUpload}
+						on:click={async () => {
+							const req = await fetch("https://hitman-resources.netlify.app/.netlify/functions/upload-smf-log", {
+								method: "POST",
+								headers: {
+									"Content-Type": "application/json"
+								},
+								body: JSON.stringify({ content: "Config:\n" + JSON.stringify(getConfig()) + "\n\nDeploy log:\n" + deployOutput })
+							})
 
-								{#if item.status === "valid"}
-									<span class="px-2 py-0.5 rounded text-xs font-semibold bg-green-900 text-green-200">Ready</span>
-								{:else if item.status === "warning"}
-									<span class="px-2 py-0.5 rounded text-xs font-semibold bg-yellow-900 text-yellow-200">Warning</span>
-								{:else}
-									<span class="px-2 py-0.5 rounded text-xs font-semibold bg-red-900 text-red-200">Invalid</span>
-								{/if}
+							if (req.status == 200) {
+								uploadedLogURL = await req.text()
 
-								<Button
-									kind="ghost"
-									size="small"
-									icon={TrashCan}
-									iconDescription="Remove"
-									on:click={() => removeStagedMod(item.id)}
-								/>
-							</div>
-						</div>
-
-						{#if item.status === "invalid"}
-							<div class="mt-2 text-xs text-red-400 bg-red-950/50 p-2 rounded border border-red-900/50">
-								{#each item.errors as error}
-									<div>• {error}</div>
-								{/each}
-							</div>
-						{/if}
-
-						{#if item.status === "warning"}
-							<div class="mt-2 text-xs text-yellow-400 bg-yellow-950/50 p-2 rounded border border-yellow-900/50">
-								{#each item.warnings as warning}
-									<div>• {warning}</div>
-								{/each}
-							</div>
-						{/if}
-
-						{#if item.type === "rpkg" && item.status !== "invalid"}
-							<div class="mt-2 flex flex-col gap-1">
-								<label class="text-xs text-neutral-400" for="rpkgName-{item.id}">Mod folder name:</label>
-								<input
-									id="rpkgName-{item.id}"
-									type="text"
-									class="px-3 py-1.5 rounded bg-neutral-900 border border-neutral-700 text-sm text-white focus:outline-none focus:border-blue-500 w-full"
-									bind:value={item.rpkgNameInput}
-								/>
-							</div>
-						{/if}
-
-						{#if item.type === "framework" && item.status !== "invalid"}
-							<div class="mt-2 text-xs text-neutral-400">
-								Contains {item.mods.length} framework mod{item.mods.length > 1 ? 's' : ''}:
-								<ul class="list-disc list-inside mt-1 ml-2 text-neutral-300">
-									{#each item.mods as m}
-										<li>{m.name} <span class="text-neutral-500">({m.id})</span></li>
-									{/each}
-								</ul>
-							</div>
-						{/if}
-					</div>
-				{/each}
+								frameworkDeployModalOpen = false
+								uploadLogModalOpen = true
+							} else {
+								uploadLogFailedModalOpen = true
+							}
+						}}
+					>
+						Upload mod list and log
+					</Button>
+					<span class="text-red-300">Deploy unsuccessful</span>
+				{/if}
 			</div>
 		{/if}
-	</div>
-</Modal>
+	</Modal>
 
-<Modal
-	alert
-	bind:open={displayExtractedModsDialog}
-	modalHeading="Incorrectly installed mod{extractedMods.length > 1 ? 's' : ''}"
-	primaryButtonText="OK"
-	shouldSubmitOnEnter={false}
-	on:submit={() => (displayExtractedModsDialog = false)}
->
-	<p>
-		The mod{extractedMods.length > 1 ? "s" : ""}
-		{extractedMods.slice(0, -1).length ? extractedMods.slice(0, -1).join(", ") + " and " + extractedMods[extractedMods.length - 1] : extractedMods[0]}
-		{extractedMods.length > 1 ? "were" : "was"} installed by extracting the ZIP file directly to the Mods folder. That's not how you're meant to install mods; doing things this way could pose risks
-		as it bypasses the framework's checks for mod validity and safety. Instead, use the Add a Mod button to add any mods you want. This message won't be shown again for {extractedMods.length > 1
-			? "these mods"
-			: "this mod"}.
+	<Modal
+		open={bulkImportModalOpen}
+		modalHeading="Staged Mods for Import"
+		primaryButtonText="Import Valid Mods"
+		secondaryButtonText="Cancel"
+		primaryButtonDisabled={stagedMods.filter((sm) => sm.status !== "invalid").length === 0}
+		on:click:button--primary={executeBulkImport}
+		on:click:button--secondary={cancelBulkImport}
+		on:close={cancelBulkImport}
+	>
+		<div class="mt-4 max-h-[50vh] overflow-y-auto overflow-x-hidden pr-2">
+			{#if stageInProgress}
+				<div class="flex flex-col items-center justify-center py-8">
+					<ProgressBar helperText="Analyzing and staging mods..." />
+				</div>
+			{:else}
+				<div class="flex flex-col gap-4">
+					{#each stagedMods as item (item.id)}
+						<div class="flex flex-col gap-2 rounded bg-neutral-800 p-4 border border-neutral-700">
+							<div class="flex items-center justify-between gap-4">
+								<div class="flex flex-col min-w-0">
+									<span class="font-bold text-white truncate text-[1rem]">{item.fileName}</span>
+									<span class="text-xs text-neutral-400 truncate">{item.filePath}</span>
+								</div>
+								<div class="flex items-center gap-2 flex-shrink-0">
+									{#if item.type === "framework"}
+										<span class="px-2 py-0.5 rounded text-xs font-semibold bg-blue-900 text-blue-200">Framework Mod</span>
+									{:else if item.type === "rpkg"}
+										<span class="px-2 py-0.5 rounded text-xs font-semibold bg-purple-900 text-purple-200">RPKG Mod</span>
+									{:else}
+										<span class="px-2 py-0.5 rounded text-xs font-semibold bg-neutral-700 text-neutral-300">Unknown</span>
+									{/if}
+
+									{#if item.status === "valid"}
+										<span class="px-2 py-0.5 rounded text-xs font-semibold bg-green-900 text-green-200">Ready</span>
+									{:else if item.status === "warning"}
+										<span class="px-2 py-0.5 rounded text-xs font-semibold bg-yellow-900 text-yellow-200">Warning</span>
+									{:else}
+										<span class="px-2 py-0.5 rounded text-xs font-semibold bg-red-900 text-red-200">Invalid</span>
+									{/if}
+
+									<Button kind="ghost" size="small" icon={TrashCan} iconDescription="Remove" on:click={() => removeStagedMod(item.id)} />
+								</div>
+							</div>
+
+							{#if item.status === "invalid"}
+								<div class="mt-2 text-xs text-red-400 bg-red-950/50 p-2 rounded border border-red-900/50">
+									{#each item.errors as error}
+										<div>• {error}</div>
+									{/each}
+								</div>
+							{/if}
+
+							{#if item.status === "warning"}
+								<div class="mt-2 text-xs text-yellow-400 bg-yellow-950/50 p-2 rounded border border-yellow-900/50">
+									{#each item.warnings as warning}
+										<div>• {warning}</div>
+									{/each}
+								</div>
+							{/if}
+
+							{#if item.type === "rpkg" && item.status !== "invalid"}
+								<div class="mt-2 flex flex-col gap-1">
+									<label class="text-xs text-neutral-400" for="rpkgName-{item.id}">Mod folder name:</label>
+									<input
+										id="rpkgName-{item.id}"
+										type="text"
+										class="px-3 py-1.5 rounded bg-neutral-900 border border-neutral-700 text-sm text-white focus:outline-none focus:border-blue-500 w-full"
+										bind:value={item.rpkgNameInput}
+									/>
+								</div>
+							{/if}
+
+							{#if item.type === "framework" && item.status !== "invalid"}
+								<div class="mt-2 text-xs text-neutral-400">
+									Contains {item.mods.length} framework mod{item.mods.length > 1 ? "s" : ""}:
+									<ul class="list-disc list-inside mt-1 ml-2 text-neutral-300">
+										{#each item.mods as m}
+											<li>
+												{m.name}
+												<span class="text-neutral-500">({m.id})</span>
+											</li>
+										{/each}
+									</ul>
+								</div>
+							{/if}
+						</div>
+					{/each}
+				</div>
+			{/if}
+		</div>
+	</Modal>
+
+	<Modal
+		alert
+		bind:open={displayExtractedModsDialog}
+		modalHeading="Incorrectly installed mod{extractedMods.length > 1 ? 's' : ''}"
+		primaryButtonText="OK"
+		shouldSubmitOnEnter={false}
+		on:submit={() => (displayExtractedModsDialog = false)}
+	>
+		<p>
+			The mod{extractedMods.length > 1 ? "s" : ""}
+			{extractedMods.slice(0, -1).length ? extractedMods.slice(0, -1).join(", ") + " and " + extractedMods[extractedMods.length - 1] : extractedMods[0]}
+			{extractedMods.length > 1 ? "were" : "was"} installed by extracting the ZIP file directly to the Mods folder. That's not how you're meant to install mods; doing things this way could pose risks
+			as it bypasses the framework's checks for mod validity and safety. Instead, use the Add a Mod button to add any mods you want. This message won't be shown again for {extractedMods.length >
+			1
+				? "these mods"
+				: "this mod"}.
+			<br />
+			<br />
+			If you're seeing this after creating a new mod yourself, you should enable developer mode in the information page - it'll improve your experience and let you use the mod authoring tools in
+			the Mod Manager.
+		</p>
+	</Modal>
+
+	<Modal alert bind:open={uploadLogFailedModalOpen} modalHeading="Couldn't upload log" primaryButtonText="OK" shouldSubmitOnEnter={false} on:submit={() => (uploadLogFailedModalOpen = false)}>
+		<p>Your log couldn't be uploaded. Make sure you're connected to the Internet.</p>
+	</Modal>
+
+	<Modal alert bind:open={uploadLogModalOpen} modalHeading="Log uploaded" primaryButtonText="OK" shouldSubmitOnEnter={false} on:submit={() => (uploadLogModalOpen = false)}>
+		<p class="mb-2">Your deploy log has been anonymously uploaded to the Internet.</p>
+		<CodeSnippet code={uploadedLogURL} />
 		<br />
+		<div class="mb-6" />
+	</Modal>
+
+	<Modal passiveModal open={autoInstallDownloading} modalHeading={"Downloading the mod"} preventCloseOnClickOutside>
+		<div class="mb-2">The mod is currently being downloaded - please wait.</div>
 		<br />
-		If you're seeing this after creating a new mod yourself, you should enable developer mode in the information page - it'll improve your experience and let you use the mod authoring tools in the
-		Mod Manager.
-	</p>
-</Modal>
+		<ProgressBar kind="inline" value={autoInstallDownloadProgress} max={autoInstallDownloadSize} labelText="Downloading..." />
+	</Modal>
 
-<Modal alert bind:open={uploadLogFailedModalOpen} modalHeading="Couldn't upload log" primaryButtonText="OK" shouldSubmitOnEnter={false} on:submit={() => (uploadLogFailedModalOpen = false)}>
-	<p>Your log couldn't be uploaded. Make sure you're connected to the Internet.</p>
-</Modal>
-
-<Modal alert bind:open={uploadLogModalOpen} modalHeading="Log uploaded" primaryButtonText="OK" shouldSubmitOnEnter={false} on:submit={() => (uploadLogModalOpen = false)}>
-	<p class="mb-2">Your deploy log has been anonymously uploaded to the Internet.</p>
-	<CodeSnippet code={uploadedLogURL} />
-	<br />
-	<div class="mb-6" />
-</Modal>
-
-<Modal passiveModal open={autoInstallDownloading} modalHeading={"Downloading the mod"} preventCloseOnClickOutside>
-	<div class="mb-2">The mod is currently being downloaded - please wait.</div>
-	<br />
-	<ProgressBar kind="inline" value={autoInstallDownloadProgress} max={autoInstallDownloadSize} labelText="Downloading..." />
-</Modal>
-
-<Modal
-	bind:open={autoInstallModalOpen}
-	modalHeading="Installing {autoInstallModName}"
-	primaryButtonText="OK"
-	secondaryButtonText="Cancel"
-	shouldSubmitOnEnter={false}
-	on:click:button--secondary={() => (autoInstallModalOpen = false)}
-	on:click:button--primary={() => {
-		autoInstallModalOpen = false
-		stageFiles(["./tempArchive"])
-	}}
->
-	<p>The mod {autoInstallModName} has been downloaded via a link - would you like to install it?</p>
-</Modal>
+	<Modal
+		bind:open={autoInstallModalOpen}
+		modalHeading="Installing {autoInstallModName}"
+		primaryButtonText="OK"
+		secondaryButtonText="Cancel"
+		shouldSubmitOnEnter={false}
+		on:click:button--secondary={() => (autoInstallModalOpen = false)}
+		on:click:button--primary={() => {
+			autoInstallModalOpen = false
+			stageFiles(["./tempArchive"])
+		}}
+	>
+		<p>The mod {autoInstallModName} has been downloaded via a link - would you like to install it?</p>
+	</Modal>
 {/if}
 
 <style>

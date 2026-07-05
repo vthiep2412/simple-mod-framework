@@ -15,7 +15,7 @@
 
 	import { Button, InlineLoading, Modal, ProgressBar } from "carbon-components-svelte"
 
-	import { getAllMods, getConfig, getManifestFromModID, modIsFramework, getModFolder, mergeConfig, FrameworkVersion, clearModsCache, preloadModsCache, cacheLoadStartTimestamp, cacheLoadStartCaller } from "$lib/utils"
+	import { getAllMods, getConfig, getManifestFromModID, modIsFramework, getModFolder, mergeConfig, FrameworkVersion, clearModsCache, preloadModsCache, cacheLoadStartTimestamp, cacheLoadStartCaller, removeDirectoryRecursive } from "$lib/utils"
 
 	import { v4 } from "uuid"
 	import { marked } from "marked"
@@ -241,11 +241,13 @@
 				}
 			}
 
-			githubReleaseMarkdownBody = marked(
-				Object.entries(sections)
-					.map(([a, b]) => a + "\n" + b.join("\n"))
-					.join("\n"),
-				{ gfm: true }
+			githubReleaseMarkdownBody = window.sanitizeHtml(
+				marked(
+					Object.entries(sections)
+						.map(([a, b]) => a + "\n" + b.join("\n"))
+						.join("\n"),
+					{ gfm: true }
+				)
 			)
 
 			canAutomaticallyUpdate = !githubReleaseMarkdownBody.includes("CANNOT AUTOMATICALLY UPDATE")
@@ -500,6 +502,19 @@
 		let chunksAll
 
 		try {
+			const url = new URL(updatingMod!.url)
+			if (!(trustedHosts.has(url.hostname) || url.hostname.split(".").slice(-2).join(".") === "github.io")) {
+				window.alert("Security error: Untrusted host for mod update: " + url.hostname)
+				updatingMod = null
+				return
+			}
+		} catch (err) {
+			window.alert("Security error: Invalid update URL")
+			updatingMod = null
+			return
+		}
+
+		try {
 			const response = await fetch(updatingMod!.url)
 			const reader = response.body!.getReader()
 
@@ -546,7 +561,7 @@
 				throw new Error("Mod update ZIP has files in the root!")
 			}
 
-			window.fs.removeSync(getModFolder(updatingMod!.id))
+			await removeDirectoryRecursive(getModFolder(updatingMod!.id))
 
 			window.fs.copySync("./staging", "../Mods")
 

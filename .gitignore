@@ -20,3 +20,9 @@ src/smf-rust.node
 src/smf-rust.d.ts
 
 tmp_default_app/
+
+cache/
+temp/
+staging/
+.vscode/
+Mod Manager/simulate-deploy.cjs

@@ -5,7 +5,7 @@
 	import { Button, ClickableTile, InlineLoading, InlineNotification, TextInput } from "carbon-components-svelte"
 	import { page } from "$app/stores"
 
-	import { alterModManifest, FrameworkVersion, getManifestFromModID, getModFolder, setModManifest, validateModFolder } from "$lib/utils"
+	import { alterModManifest, FrameworkVersion, getManifestFromModID, getModFolder, setModManifest, validateModFolder, preloadModsCache } from "$lib/utils"
 	import TextInputModal from "$lib/TextInputModal.svelte"
 
 	import Edit from "carbon-icons-svelte/lib/Edit.svelte"
@@ -30,19 +30,18 @@
 		contentFolders: ["content"],
 		frameworkVersion: FrameworkVersion
 	} as Manifest
-	$: manifest = $page.params.mod
-		? getManifestFromModID($page.params.mod, dummyForceUpdate)
-		: ({
-				version: "1.0.0",
-				id: "Example.Example",
-				name: "Loading...",
-				description: "Extremely good description",
-				authors: ["Example"],
-				contentFolders: ["content"],
-				frameworkVersion: FrameworkVersion
-		  } as Manifest)
 
-	onMount(() => (dummyForceUpdate = Math.random()))
+	let cacheLoaded = false
+
+	onMount(async () => {
+		await preloadModsCache("authoring-mod")
+		cacheLoaded = true
+		dummyForceUpdate = Math.random()
+	})
+
+	$: if (cacheLoaded && $page.params.mod) {
+		manifest = getManifestFromModID($page.params.mod, dummyForceUpdate)
+	}
 
 	let modNameInputModal: TextInputModal
 	let modNameInputModalOpen = false
@@ -60,13 +59,18 @@
 	let frameworkVersionInputChanged = false
 	let updateURLInputChanged = false
 
-	let modValidation = [true, ""]
+	let modValidation: [boolean, string] = [true, ""]
 
-	$: if ($page.params.mod) {
+	$: if (cacheLoaded && $page.params.mod && manifest && manifest.id) {
 		modValidation = validateModFolder(getModFolder(manifest.id))
 	}
 </script>
 
+{#if !cacheLoaded}
+	<div class="flex flex-col items-center justify-center h-full w-full gap-4 mt-8">
+		<InlineLoading description="Loading mod manifest..." />
+	</div>
+{:else}
 <div class="flex gap-4 items-center justify-center">
 	<h1 class="text-center" transition:scale>{manifest.name}</h1>
 	<Button kind="ghost" icon={Edit} iconDescription="Edit mod name" on:click={() => (modNameInputModalOpen = true)} />
@@ -315,6 +319,7 @@
 		}
 	}}
 />
+{/if}
 
 <style>
 	:global(.bx--btn--ghost) {
