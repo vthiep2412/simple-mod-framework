@@ -717,6 +717,13 @@
 		}
 	}
 
+	/**
+	 * Replaces a destination folder with a temporary source folder safely.
+	 * Backs up the destination first and rolls back if the replacement fails.
+	 * 
+	 * @param tempSource The path to the temporary source directory.
+	 * @param destFolder The path to the destination directory.
+	 */
 	async function safeReplaceFolder(tempSource: string, destFolder: string) {
 		const backupFolder = destFolder + ".bak"
 		let backedUp = false

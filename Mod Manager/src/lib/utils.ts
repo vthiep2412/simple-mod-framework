@@ -358,10 +358,20 @@ export function clearModsCache() {
 
 const modsBeingDeleted = new Set<string>()
 
+/**
+ * Marks a mod as undergoing deletion to suppress missing-folder alert dialogs.
+ * 
+ * @param id The ID of the mod being deleted.
+ */
 export function markModAsDeleting(id: string) {
 	modsBeingDeleted.add(id)
 }
 
+/**
+ * Removes a mod from the active deletion tracking set.
+ * 
+ * @param id The ID of the mod.
+ */
 export function unmarkModAsDeleting(id: string) {
 	modsBeingDeleted.delete(id)
 }
@@ -588,6 +598,7 @@ export function getModFolder(id: string): string {
 
 	if (!folder) {
 		if (!modsBeingDeleted.has(id)) {
+			// skipcq: JS-0052
 			window.alert(`The mod ${id} couldn't be located! This will likely cause issues in parts of the framework. If you deleted a mod folder, use the Delete Mod option next time.`)
 		}
 		throw new Error(`Couldn't find mod ${id}`)
@@ -610,6 +621,14 @@ export function modIsFramework(id: string): boolean {
 	return true
 }
 
+/**
+ * Retrieves a mod manifest by its ID, with synchronous fallback read.
+ * Returns a default manifest structure on failure to prevent UI crashes.
+ * 
+ * @param id The ID of the mod.
+ * @param _dummy Unused parameter kept for API compatibility.
+ * @returns The parsed Manifest object or a default manifest layout.
+ */
 export function getManifestFromModID(id: string, _dummy = 1): Manifest {
 	if (manifestsMap.has(id)) {
 		return manifestsMap.get(id)!
@@ -650,6 +669,12 @@ export function clearValidationCache() {
 	}
 }
 
+/**
+ * Clears validation cache entries for a specific folder from memory and localStorage.
+ * Normalizes the folder path to ensure both raw and resolved paths are cleared.
+ * 
+ * @param modFolder The path to the mod folder.
+ */
 export function clearValidationCacheForFolder(modFolder: string) {
 	const resolvedFolder = window.path.resolve(modFolder)
 	validationCache.delete(modFolder)
