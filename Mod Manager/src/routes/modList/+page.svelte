@@ -139,6 +139,41 @@
 	let deployOutput = ""
 	let deployOutputHTML = ""
 	let deployDiagnostics: string[] = []
+
+	let lastParsedLength = 0
+	let parsedHtmlLines: string[] = []
+	let lastAppendedLine = ""
+
+	function resetRenderedOutput() {
+		lastParsedLength = 0
+		parsedHtmlLines = []
+		lastAppendedLine = ""
+		deployOutputHTML = ""
+		deployWarnings = []
+	}
+
+	let consoleHeight = localStorage.getItem("console-height") || ""
+
+	let consoleObserver: ResizeObserver | null = null
+	function setupConsoleResizeObserver(node: HTMLElement) {
+		consoleObserver = new ResizeObserver((entries) => {
+			for (const entry of entries) {
+				const height = entry.target.style.height
+				if (height && height !== consoleHeight) {
+					localStorage.setItem("console-height", height)
+					consoleHeight = height
+				}
+			}
+		})
+		consoleObserver.observe(node)
+		return {
+			destroy() {
+				if (consoleObserver) {
+					consoleObserver.disconnect()
+				}
+			}
+		}
+	}
 	let deployFinished = false
 
 	let progressPercent = 0
@@ -184,7 +219,7 @@
 	window.ipc.receive("frameworkDeployModalOpen", (deployStartTime) => {
 		frameworkDeployModalOpen = true
 		deployOutput = ""
-		deployOutputHTML = ""
+		resetRenderedOutput()
 		deployFinished = false
 		hasError = false
 		errorMessage = ""
@@ -226,6 +261,53 @@
 			wasAtBottom = true
 		}
 
+		if (deployOutput.length < lastParsedLength) {
+			lastParsedLength = 0
+			parsedHtmlLines = []
+			lastAppendedLine = ""
+		}
+
+		const isFinal = deployFinished || hasError
+		const newChunk = deployOutput.substring(lastParsedLength)
+		if (newChunk) {
+			let completeChunk = ""
+			let consumedLength = 0
+
+			if (isFinal) {
+				completeChunk = newChunk
+				consumedLength = newChunk.length
+			} else {
+				const lastNewlineIdx = newChunk.lastIndexOf("\n")
+				if (lastNewlineIdx !== -1) {
+					completeChunk = newChunk.substring(0, lastNewlineIdx + 1)
+					consumedLength = completeChunk.length
+				}
+			}
+
+			if (consumedLength > 0) {
+				lastParsedLength += consumedLength
+
+				const rawLinesChunk = completeChunk.split(/\r?\n/)
+				if (rawLinesChunk[rawLinesChunk.length - 1] === "") {
+					rawLinesChunk.pop()
+				}
+
+				const newLines: string[] = []
+				for (const line of rawLinesChunk) {
+					if (line !== lastAppendedLine) {
+						newLines.push(line)
+						lastAppendedLine = line
+					}
+				}
+
+				if (newLines.length > 0) {
+					const newHtmlLines = newLines.map((line) => convertAnsi.toHtml(line))
+					parsedHtmlLines.push(...newHtmlLines)
+					deployOutputHTML = parsedHtmlLines.join("\n")
+				}
+			}
+		}
+
 		// Parse lines for warnings and errors and deduplicate consecutive identical lines
 		const rawLines = deployOutput.split(/\r?\n/)
 		const lines: string[] = []
@@ -234,8 +316,6 @@
 				lines.push(rawLines[i])
 			}
 		}
-
-		deployOutputHTML = convertAnsi.toHtml(lines.join("\n"))
 
 		// 1. Error detection
 		const errorPatterns = [/.*ERROR.*?\t/, /Error:\s*(.*)/, /uncaughtException/, /unhandledRejection/]
@@ -333,7 +413,7 @@
 				el.scrollTop = el.scrollHeight
 			}
 		}, 50)
-	}, 500)
+	}, 200)
 
 	window.ipc.receive("frameworkDeployOutput", (output: string) => {
 		deployOutput = output
@@ -343,6 +423,8 @@
 	window.ipc.receive("frameworkDeployFinished", () => {
 		deployFinished = true
 		stopDeployTimer()
+		convertOutputToHTML()
+		convertOutputToHTML.flush()
 
 		const lines = deployOutput.split(/\r?\n/).map((a) => a.trim())
 		const succeeded = lines.some((a) => a.includes("Done in"))
@@ -933,7 +1015,7 @@
 					on:click={() => {
 						if (sortMods()) {
 							deployOutput = ""
-							deployOutputHTML = ""
+							resetRenderedOutput()
 							deployFinished = false
 							window.ipc.send("deploy")
 						} else {
@@ -1037,7 +1119,7 @@
 			{#if !hasError}
 				<div class="flex justify-between items-center mb-1 text-sm text-gray-200">
 					<span>{statusLabel}</span>
-					<span class="font-mono font-bold" style="color: {hasError ? '#da1e28' : '#0f62fe'};">{progressPercent}%</span>
+					<span class="font-mono font-bold" style="color: {hasError ? '#da1e28' : '#ffffff'};">{progressPercent}%</span>
 				</div>
 				<div class="bx--progress-bar__track" style="height: 8px;">
 					<div
@@ -1061,19 +1143,25 @@
 
 		<div class="flex gap-4 mt-2 items-stretch">
 			<pre
-				class="flex-1 min-h-[25vh] max-h-[35vh] overflow-y-auto whitespace-pre-wrap bg-neutral-800 p-2 border border-neutral-700/30 rounded-sm"
-				style="font-family: 'Fira Code', 'IBM Plex Mono', 'Menlo', 'DejaVu Sans Mono', 'Bitstream Vera Sans Mono', Courier, monospace; color-scheme: dark; font-size: 0.75rem;"
+				use:setupConsoleResizeObserver
+				class="flex-1 min-h-[25vh] min-w-[17.5rem] overflow-auto whitespace-pre-wrap bg-neutral-800 p-2 border border-neutral-700/30 rounded-sm"
+				style="font-family: 'Fira Code', 'IBM Plex Mono', 'Menlo', 'DejaVu Sans Mono', 'Bitstream Vera Sans Mono', Courier, monospace; color-scheme: dark; font-size: 0.75rem; resize: vertical; height: {consoleHeight ||
+					'35vh'}; max-height: 535px;"
 				id="deployOutputElement"
 				on:scroll={handleScroll}>{@html deployOutputHTML}</pre>
 
 			{#if deployWarnings.length > 0}
 				<div
-					class="min-h-[25vh] max-h-[35vh] overflow-y-auto bg-neutral-800 p-2 border border-yellow-600/40 rounded-sm text-yellow-300 text-xs flex flex-col gap-1"
-					style="width: 260px; font-family: 'Fira Code', 'IBM Plex Mono', monospace; color-scheme: dark;"
+					class="overflow-y-auto bg-neutral-800 p-2 border border-yellow-600/40 rounded-sm text-yellow-300 text-xs flex flex-col gap-1"
+					style="width: 260px; font-family: 'Fira Code', 'IBM Plex Mono', monospace; color-scheme: dark; height: {consoleHeight ||
+						'35vh'}; min-height: 25vh; max-height: 535px; margin-left: auto;"
 				>
-					<div class="font-bold border-b border-yellow-600/30 pb-1 mb-1 sticky top-0 bg-neutral-800 z-10">Warnings</div>
-					{#each deployWarnings as warning}
-						<div class="py-1 border-b border-neutral-700/50 break-words leading-relaxed">{warning}</div>
+					<div class="font-bold border-b border-yellow-600/30 pb-1 mb-1 sticky top-0 bg-neutral-800 z-10">Warnings ({deployWarnings.length})</div>
+					{#each deployWarnings as warning, index}
+						<div class="py-1 border-b border-neutral-700/50 break-words leading-relaxed">
+							<div style="color: #888888; font-weight: bold; margin-bottom: 0.25rem;">[{String(index + 1).padStart(2, "0")}]</div>
+							<div>{warning}</div>
+						</div>
 					{/each}
 				</div>
 			{/if}

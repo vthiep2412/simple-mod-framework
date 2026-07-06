@@ -2,7 +2,8 @@ const windowStateManager = require("electron-window-state")
 const contextMenu = require("electron-context-menu")
 const { app, BrowserWindow, ipcMain, dialog } = require("electron")
 const serve = require("electron-serve")
-const { spawn, execSync } = require("child_process");
+// skipcq: JS-0359
+const { spawn, execSync } = require("child_process")
 const fs = require("fs")
 const path = require("path")
 
@@ -38,7 +39,7 @@ function createWindow() {
 		defaultHeight: 600
 	})
 
-	const mainWindow = new BrowserWindow({
+	mainWindow = new BrowserWindow({
 		webPreferences: {
 			contextIsolation: true,
 			nodeIntegration: true,
@@ -83,11 +84,11 @@ function createWindow() {
 	return mainWindow
 }
 
-function loadVite(port) {
-	mainWindow.loadURL(`http://localhost:${port}`).catch((e) => {
+function loadVite(targetPort) {
+	mainWindow.loadURL(`http://localhost:${targetPort}`).catch((e) => {
 		console.log("Error loading URL, retrying", e)
 		setTimeout(() => {
-			loadVite(port)
+			loadVite(targetPort)
 		}, 200)
 	})
 }
@@ -171,7 +172,13 @@ ipcMain.on("deploy", () => {
 		deployStartTime = null
 
 		if (err) {
-			deployOutput = `Failed to start Deploy.exe: ${err?.message || String(err)}`
+			if (deployOutput) {
+				deployOutput += `\nFailed: ${err?.message || String(err)}`
+			} else {
+				const isSpawnError = err?.code === "ENOENT" || err?.syscall === "spawn"
+				const errMsg = err?.message || String(err)
+				deployOutput = isSpawnError ? `Failed to start Deploy.exe: ${errMsg}` : `Deployment failed: ${errMsg}`
+			}
 			mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
 		}
 		mainWindow.webContents.send("frameworkDeployFinished")
@@ -219,7 +226,7 @@ ipcMain.on("checkDeployStatus", () => {
 })
 
 ipcMain.on("killDeployProcess", () => {
-	if (deployProcess && deployProcess.pid) {
+	if (deployProcess?.pid) {
 		try {
 			const pid = deployProcess.pid
 			execSync(`taskkill /f /t /pid ${pid}`)

@@ -596,8 +596,7 @@ export function modIsFramework(id: string): boolean {
 	return true
 }
 
-export function getManifestFromModID(id: string, dummy = 1): Manifest {
-	void dummy
+export function getManifestFromModID(id: string, _dummy = 1): Manifest {
 	initializeModsCache()
 	const cachedManifest = manifestsMap.get(id)
 	if (cachedManifest) {
