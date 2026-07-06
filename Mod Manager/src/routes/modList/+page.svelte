@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { scale, fade } from "svelte/transition"
 	import { flip } from "svelte/animate"
-	import { onMount } from "svelte"
+	import { onMount, tick } from "svelte"
 
 	import json5 from "json5"
 	import { Button, CodeSnippet, InlineNotification, Modal, ProgressBar, Search, InlineLoading } from "carbon-components-svelte"
@@ -45,9 +45,12 @@
 		validateModFolder,
 		clearModsCache,
 		clearValidationCache,
+		clearValidationCacheForFolder,
 		preloadModsCache,
 		removeDirectoryRecursive,
-		trustedHosts
+		trustedHosts,
+		markModAsDeleting,
+		unmarkModAsDeleting
 	} from "$lib/utils"
 	import Mod from "$lib/Mod.svelte"
 	import TextInputModal from "$lib/TextInputModal.svelte"
@@ -476,6 +479,8 @@
 
 	let bulkImportModalOpen = false
 	let stageInProgress = false
+	let importInProgress = false
+	let deleteInProgress = false
 	let currentStagingRunId = 0
 	let activeStagingProcess: any = null
 	let stagedMods: Array<{
@@ -712,6 +717,39 @@
 		}
 	}
 
+	async function safeReplaceFolder(tempSource: string, destFolder: string) {
+		const backupFolder = destFolder + ".bak"
+		let backedUp = false
+
+		try {
+			if (await window.fs.pathExists(destFolder)) {
+				if (await window.fs.pathExists(backupFolder)) {
+					await window.fs.remove(backupFolder)
+				}
+				await window.fs.rename(destFolder, backupFolder)
+				backedUp = true
+			}
+
+			await window.fs.rename(tempSource, destFolder)
+
+			if (backedUp) {
+				await window.fs.remove(backupFolder)
+			}
+		} catch (error) {
+			if (backedUp) {
+				try {
+					if (await window.fs.pathExists(destFolder)) {
+						await window.fs.remove(destFolder)
+					}
+					await window.fs.rename(backupFolder, destFolder)
+				} catch (rollbackError) {
+					console.error("Failed to rollback during folder replacement:", rollbackError)
+				}
+			}
+			throw error
+		}
+	}
+
 	async function executeBulkImport() {
 		const modsToImport = stagedMods.filter((sm) => sm.status !== "invalid")
 
@@ -742,71 +780,83 @@
 			}
 		}
 
-		for (const staged of modsToImport) {
-			if (staged.type === "framework") {
-				for (const mod of staged.mods) {
-					const existingFolder = getConfig().knownMods.includes(mod.id) ? getModFolder(mod.id) : null
-					const destFolder = existingFolder || window.path.join("..", "Mods", mod.id)
-					const tempDest = destFolder + ".tmp"
-					if (window.fs.existsSync(tempDest)) {
-						window.fs.removeSync(tempDest)
-					}
-					window.fs.copySync(mod.folder, tempDest)
-					if (window.fs.existsSync(destFolder)) {
-						window.fs.removeSync(destFolder)
-					}
-					window.fs.renameSync(tempDest, destFolder)
-
-					if (!getConfig().knownMods.includes(mod.id)) {
-						mergeConfig({
-							knownMods: [...getConfig().knownMods, mod.id]
-						})
-					}
-				}
-			} else if (staged.type === "rpkg") {
-				const rawName = staged.rpkgNameInput ? staged.rpkgNameInput.trim() : staged.fileName.replace(/\.[^/.]+$/, "")
-				const modName = sanitizeModName(rawName)
-				const destFolder = window.path.join("..", "Mods", modName)
-				const tempDest = destFolder + ".tmp"
-				if (window.fs.existsSync(tempDest)) {
-					window.fs.removeSync(tempDest)
-				}
-
-				for (const mod of staged.mods) {
-					if (mod.rpkgs) {
-						for (const file of mod.rpkgs) {
-							const destDir = window.path.join(tempDest, file.chunk)
-							window.fs.ensureDirSync(destDir)
-							window.fs.copyFileSync(file.path, window.path.join(destDir, window.path.basename(file.path)))
-						}
-					}
-				}
-
-				if (window.fs.existsSync(destFolder)) {
-					window.fs.removeSync(destFolder)
-				}
-				window.fs.renameSync(tempDest, destFolder)
-
-				if (!getConfig().knownMods.includes(modName)) {
-					mergeConfig({
-						knownMods: [...getConfig().knownMods, modName]
-					})
-				}
-			}
-		}
+		importInProgress = true
 
 		try {
-			window.fs.removeSync("./staging")
-		} catch {}
+			for (const staged of modsToImport) {
+				if (staged.type === "framework") {
+					for (const mod of staged.mods) {
+						const existingFolder = getConfig().knownMods.includes(mod.id) ? getModFolder(mod.id) : null
+						const destFolder = existingFolder || window.path.join("..", "Mods", mod.id)
+						const tempDest = destFolder + ".tmp"
+						if (await window.fs.pathExists(tempDest)) {
+							await window.fs.remove(tempDest)
+						}
+						await window.fs.copy(mod.folder, tempDest)
+						await safeReplaceFolder(tempDest, destFolder)
 
-		clearModsCache()
-		clearValidationCache()
+						if (!getConfig().knownMods.includes(mod.id)) {
+							mergeConfig({
+								knownMods: [...getConfig().knownMods, mod.id]
+							})
+						}
+						clearValidationCacheForFolder(destFolder)
+					}
+				} else if (staged.type === "rpkg") {
+					const rawName = staged.rpkgNameInput ? staged.rpkgNameInput.trim() : staged.fileName.replace(/\.[^/.]+$/, "")
+					const modName = sanitizeModName(rawName)
+					const destFolder = window.path.join("..", "Mods", modName)
+					const tempDest = destFolder + ".tmp"
+					if (await window.fs.pathExists(tempDest)) {
+						await window.fs.remove(tempDest)
+					}
 
-		forceModListsUpdate = Math.random()
-		markChanged()
+					for (const mod of staged.mods) {
+						if (mod.rpkgs) {
+							for (const file of mod.rpkgs) {
+								const destDir = window.path.join(tempDest, file.chunk)
+								await window.fs.ensureDir(destDir)
+								await window.fs.copy(file.path, window.path.join(destDir, window.path.basename(file.path)))
+							}
+						}
+					}
 
-		bulkImportModalOpen = false
-		stagedMods = []
+					await safeReplaceFolder(tempDest, destFolder)
+
+					if (!getConfig().knownMods.includes(modName)) {
+						mergeConfig({
+							knownMods: [...getConfig().knownMods, modName]
+						})
+					}
+					clearValidationCacheForFolder(destFolder)
+				}
+			}
+
+			try {
+				await window.fs.remove("./staging")
+			} catch {}
+
+			// NOTE: We are running a full asynchronous cache rebuild here.
+			/*  This can take some time if the user has many mods installed
+			    as it scans directories and reads manifest JSON files in the background.
+
+			    A future optimization could update in-memory cache maps
+			    incrementally to run it in 0ms, but that would significantly
+			    increase the complexity and risk of cache drift.
+			*/
+			bulkImportModalOpen = false
+			stagedMods = []
+
+			await preloadModsCache("bulkImport", true)
+
+			forceModListsUpdate = Math.random()
+			markChanged()
+		} catch (error) {
+			console.error("Failed to execute bulk import:", error)
+			window.alert(`Failed to import mods: ${error instanceof Error ? error.message : String(error)}`)
+		} finally {
+			importInProgress = false
+		}
 	}
 
 	function removeStagedMod(id: string) {
@@ -825,6 +875,9 @@
 	}
 
 	function cancelBulkImport() {
+		if (importInProgress) {
+			return
+		}
 		currentStagingRunId++
 		if (activeStagingProcess) {
 			try {
@@ -1083,25 +1136,46 @@
 		modalHeading="Delete mod"
 		primaryButtonText="Delete the mod"
 		secondaryButtonText="Cancel"
-		on:click:button--secondary={() => (deleteModModalOpen = false)}
+		primaryButtonDisabled={deleteInProgress}
+		on:click:button--secondary={() => {
+			if (!deleteInProgress) deleteModModalOpen = false
+		}}
 		on:submit={async () => {
-			await removeDirectoryRecursive(getModFolder(deleteModInProgress))
-			mergeConfig({ knownMods: getConfig().knownMods.filter((a) => a != deleteModInProgress) })
+			deleteInProgress = true
+			markModAsDeleting(deleteModInProgress)
+			try {
+				const modFolder = getModFolder(deleteModInProgress)
+				await removeDirectoryRecursive(modFolder)
+				mergeConfig({ knownMods: getConfig().knownMods.filter((a) => a != deleteModInProgress) })
+				clearValidationCacheForFolder(modFolder)
 
-			clearModsCache()
-			clearValidationCache()
-			forceModListsUpdate = Math.random()
-			markChanged()
-			deleteModModalOpen = false
+				deleteModModalOpen = false
+				await preloadModsCache("deleteMod", true)
+
+				forceModListsUpdate = Math.random()
+				markChanged()
+			} catch (e) {
+				console.error("Failed to delete mod:", e)
+				window.alert(`Failed to delete mod: ${e instanceof Error ? e.message : String(e)}`)
+			} finally {
+				await tick()
+				unmarkModAsDeleting(deleteModInProgress)
+				deleteInProgress = false
+				deleteModInProgress = ""
+			}
 		}}
 		shouldSubmitOnEnter={false}
 	>
-		<p>
-			{#if deleteModInProgress}
+		{#if deleteInProgress}
+			<div class="flex flex-col items-center justify-center py-4">
+				<ProgressBar helperText="Deleting mod..." />
+			</div>
+		{:else if deleteModInProgress}
+			<p>
 				Are you sure you want to permanently remove the <i>{modIsFramework(deleteModInProgress) ? getManifestFromModID(deleteModInProgress).name : deleteModInProgress}</i>
 				mod from the Mods folder? You cannot undo this.
-			{/if}
-		</p>
+			</p>
+		{/if}
 	</Modal>
 
 	<Modal alert bind:open={dependencyCycleModalOpen} modalHeading="Dependency cycle (couldn't sort mods)" primaryButtonText="OK" shouldSubmitOnEnter={false}>
@@ -1223,7 +1297,7 @@
 		modalHeading="Staged Mods for Import"
 		primaryButtonText="Import Valid Mods"
 		secondaryButtonText="Cancel"
-		primaryButtonDisabled={stagedMods.filter((sm) => sm.status !== "invalid").length === 0}
+		primaryButtonDisabled={importInProgress || stagedMods.filter((sm) => sm.status !== "invalid").length === 0}
 		on:click:button--primary={executeBulkImport}
 		on:click:button--secondary={cancelBulkImport}
 		on:close={cancelBulkImport}
@@ -1232,6 +1306,10 @@
 			{#if stageInProgress}
 				<div class="flex flex-col items-center justify-center py-8">
 					<ProgressBar helperText="Analyzing and staging mods..." />
+				</div>
+			{:else if importInProgress}
+				<div class="flex flex-col items-center justify-center py-8">
+					<ProgressBar helperText="Importing mods..." />
 				</div>
 			{:else}
 				<div class="flex flex-col gap-4">
@@ -1365,6 +1443,7 @@
 	>
 		<p>The mod {autoInstallModName} has been downloaded via a link - would you like to install it?</p>
 	</Modal>
+
 {/if}
 
 <style>
@@ -1403,5 +1482,17 @@
 		:global(.bx--modal-container) {
 			width: 56%;
 		}
+	}
+
+	:global(body.bx--body--with-modal-open) {
+		overflow: auto !important;
+	}
+
+	:global(.bx--modal) {
+		will-change: opacity;
+	}
+
+	:global(.bx--modal-container) {
+		will-change: transform, opacity;
 	}
 </style>

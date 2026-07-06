@@ -8,7 +8,12 @@ const fs = require("fs")
 const path = require("path")
 
 try {
-	require("electron-reloader")(module)
+	require("electron-reloader")(module, {
+		ignore: [
+			/staging/,
+			/tempArchive/
+		]
+	})
 } catch (e) {
 	console.error(e)
 }
@@ -240,7 +245,7 @@ ipcMain.on("killDeployProcess", () => {
 ipcMain.on("modFileOpenDialog", () => {
 	mainWindow.webContents.send(
 		"modFileOpenDialogResult",
-		dialog.showOpenDialogSync({
+		dialog.showOpenDialogSync(mainWindow, {
 			title: "Add a mod file",
 			buttonLabel: "Select",
 			filters: [{ name: "Mod Files", extensions: ["zip", "7z", "rar", "rpkg"] }],
@@ -252,7 +257,7 @@ ipcMain.on("modFileOpenDialog", () => {
 ipcMain.on("runtimePackageOpenDialog", () => {
 	mainWindow.webContents.send(
 		"runtimePackageOpenDialogResult",
-		dialog.showOpenDialogSync({
+		dialog.showOpenDialogSync(mainWindow, {
 			title: "Select an RPKG file",
 			buttonLabel: "Select",
 			filters: [{ name: "RPKG Files", extensions: ["rpkg"] }],
@@ -264,7 +269,7 @@ ipcMain.on("runtimePackageOpenDialog", () => {
 ipcMain.on("imageOpenDialog", () => {
 	mainWindow.webContents.send(
 		"imageOpenDialogResult",
-		dialog.showOpenDialogSync({
+		dialog.showOpenDialogSync(mainWindow, {
 			title: "Select an image",
 			buttonLabel: "Select",
 			filters: [{ name: "Image Files", extensions: ["png", "jpg", "apng", "gif", "webp", "svg", "jpeg", "jfif"] }],

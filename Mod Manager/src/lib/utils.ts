@@ -356,6 +356,17 @@ export function clearModsCache() {
 	preloadModsCache("clearModsCache", true)
 }
 
+const modsBeingDeleted = new Set<string>()
+
+export function markModAsDeleting(id: string) {
+	modsBeingDeleted.add(id)
+}
+
+export function unmarkModAsDeleting(id: string) {
+	modsBeingDeleted.delete(id)
+}
+
+
 let cacheLoadStartTimestamp: number | null = null
 let cacheLoadStartCaller: string | null = null
 
@@ -551,8 +562,9 @@ export function initializeModsCache() {
 }
 
 export function setModManifest(modID: string, manifest: Manifest) {
-	window.fs.writeFileSync(window.path.join(getModFolder(modID), "manifest.json"), JSON.stringify(manifest, undefined, "\t"))
-	clearValidationCache()
+	const modFolder = getModFolder(modID)
+	window.fs.writeFileSync(window.path.join(modFolder, "manifest.json"), JSON.stringify(manifest, undefined, "\t"))
+	clearValidationCacheForFolder(modFolder)
 	manifestsMap.set(modID, manifest)
 }
 
@@ -563,7 +575,7 @@ export function getModFolder(id: string): string {
 		return cachedFolder
 	}
 
-	console.warn(`[WARNING] Cache miss for mod folder ID: ${id}. Performing synchronous fallback directory search.`)
+	console.warn(`Cache miss for mod folder ID: ${id}. Performing synchronous fallback directory search.`)
 	const folder = modIsFramework(id)
 		? window.fs
 				.readdirSync(window.path.join("..", "Mods"))
@@ -575,7 +587,9 @@ export function getModFolder(id: string): string {
 		: id
 
 	if (!folder) {
-		window.alert(`The mod ${id} couldn't be located! This will likely cause issues in parts of the framework. If you deleted a mod folder, use the Delete Mod option next time.`)
+		if (!modsBeingDeleted.has(id)) {
+			window.alert(`The mod ${id} couldn't be located! This will likely cause issues in parts of the framework. If you deleted a mod folder, use the Delete Mod option next time.`)
+		}
 		throw new Error(`Couldn't find mod ${id}`)
 	}
 
@@ -597,18 +611,26 @@ export function modIsFramework(id: string): boolean {
 }
 
 export function getManifestFromModID(id: string, _dummy = 1): Manifest {
-	initializeModsCache()
-	const cachedManifest = manifestsMap.get(id)
-	if (cachedManifest) {
-		return cachedManifest
+	if (manifestsMap.has(id)) {
+		return manifestsMap.get(id)!
 	}
 
 	console.warn(`[WARNING] Cache miss for manifest ID: ${id}. Performing synchronous fallback file read.`)
-	if (modIsFramework(id)) {
-		return json5.parse(String(window.fs.readFileSync(window.path.join(getModFolder(id), "manifest.json"), "utf8")))
-	} else {
-		throw new Error(`Mod ${id} is not a framework mod`)
+	try {
+		if (modIsFramework(id)) {
+			return json5.parse(String(window.fs.readFileSync(window.path.join(getModFolder(id), "manifest.json"), "utf8")))
+		}
+	} catch (e) {
+		console.warn(`[WARNING] Failed to read fallback manifest for ${id}:`, e)
 	}
+	return {
+		id,
+		name: id,
+		description: "",
+		authors: [],
+		version: "0.0.0",
+		frameworkVersion: ""
+	} as Manifest
 }
 
 export function getAllMods(): string[] {
@@ -623,6 +645,22 @@ export function clearValidationCache() {
 	for (let i = localStorage.length - 1; i >= 0; i--) {
 		const key = localStorage.key(i)
 		if (key?.startsWith("val-cache:")) {
+			localStorage.removeItem(key)
+		}
+	}
+}
+
+export function clearValidationCacheForFolder(modFolder: string) {
+	const resolvedFolder = window.path.resolve(modFolder)
+	validationCache.delete(modFolder)
+	validationCache.delete(resolvedFolder)
+
+	const prefix1 = `val-cache:${window.path.join(modFolder, "manifest.json")}:`
+	const prefix2 = `val-cache:${window.path.join(resolvedFolder, "manifest.json")}:`
+
+	for (let i = localStorage.length - 1; i >= 0; i--) {
+		const key = localStorage.key(i)
+		if (key && (key.startsWith(prefix1) || key.startsWith(prefix2))) {
 			localStorage.removeItem(key)
 		}
 	}

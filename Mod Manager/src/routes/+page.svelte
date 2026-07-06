@@ -405,7 +405,6 @@
 				const currentVersion = getManifestFromModID(mod).version
 				const cached = cachedData[mod]
 				if (!force && cached && Date.now() - cached.timestamp < 20 * 60 * 1000 && cached.localVersion === currentVersion) {
-					console.info(`Mod update cache hit for: ${getManifestFromModID(mod).name}! Reusing cached check.`)
 					modUpdateJSONs.push([mod, cached.updateResult])
 					continue
 				}
@@ -567,9 +566,36 @@
 				throw new Error("Mod update ZIP has files in the root!")
 			}
 
-			await removeDirectoryRecursive(getModFolder(updatingMod!.id))
+			const destFolder = getModFolder(updatingMod!.id)
+			const backupFolder = destFolder + ".bak"
+			let backedUp = false
 
-			window.fs.copySync("./staging", "../Mods")
+			if (window.fs.existsSync(destFolder)) {
+				if (window.fs.existsSync(backupFolder)) {
+					window.fs.removeSync(backupFolder)
+				}
+				window.fs.renameSync(destFolder, backupFolder)
+				backedUp = true
+			}
+
+			try {
+				window.fs.copySync("./staging", "../Mods")
+				if (backedUp) {
+					window.fs.removeSync(backupFolder)
+				}
+			} catch (copyError) {
+				if (backedUp) {
+					try {
+						if (window.fs.existsSync(destFolder)) {
+							window.fs.removeSync(destFolder)
+						}
+						window.fs.renameSync(backupFolder, destFolder)
+					} catch (rollbackError) {
+						console.error("Failed to rollback during mod update:", rollbackError)
+					}
+				}
+				throw copyError
+			}
 
 			window.fs.removeSync("./staging")
 			window.fs.removeSync("./tempArchive")
