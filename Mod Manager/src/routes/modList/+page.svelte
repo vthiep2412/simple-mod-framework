@@ -153,18 +153,28 @@
 		lastAppendedLine = ""
 		deployOutputHTML = ""
 		deployWarnings = []
+		analyzedMods = new Set()
+		deployedMods = new Set()
+		currentModName = ""
+		currentPhase = "preparing"
+		totalLinesCount = 0
 	}
 
 	let consoleHeight = localStorage.getItem("console-height") || ""
 
 	let consoleObserver: ResizeObserver | null = null
+	let saveHeightTimeout: any = null
+
 	function setupConsoleResizeObserver(node: HTMLElement) {
 		consoleObserver = new ResizeObserver((entries) => {
 			for (const entry of entries) {
 				const height = entry.target.style.height
 				if (height && height !== consoleHeight) {
-					localStorage.setItem("console-height", height)
-					consoleHeight = height
+					clearTimeout(saveHeightTimeout)
+					saveHeightTimeout = setTimeout(() => {
+						localStorage.setItem("console-height", height)
+						consoleHeight = height
+					}, 200)
 				}
 			}
 		})
@@ -174,6 +184,7 @@
 				if (consoleObserver) {
 					consoleObserver.disconnect()
 				}
+				clearTimeout(saveHeightTimeout)
 			}
 		}
 	}
@@ -190,26 +201,224 @@
 	let totalMods = 0
 	let stagedCount = 0
 
-	function startDeployTimer(deployStartTime) {
+	let analyzedMods = new Set()
+	let deployedMods = new Set()
+	let currentModName = ""
+	let currentPhase = "preparing"
+	let startPerformanceTime = 0
+	let totalLinesCount = 0
+
+	let timerWorker: Worker | null = null
+	let parserWorker: Worker | null = null
+
+	function startDeployTimer(deployStartTime: number | null) {
+		if (timerWorker) {
+			timerWorker.terminate()
+		}
+		if (parserWorker) {
+			parserWorker.terminate()
+		}
 		clearInterval(deployTimerInterval)
 		clearTimeout(autoScrollTimeout)
-		const startTime = deployStartTime || Date.now()
-		elapsedSeconds = Math.floor((Date.now() - startTime) / 1000)
-		const m = Math.floor(elapsedSeconds / 60)
-		const s = elapsedSeconds % 60
-		elapsedTimeStr = m > 0 ? `${m}m ${s}s` : `${s}s`
+		const offset = deployStartTime ? Date.now() - deployStartTime : 0
+		startPerformanceTime = performance.now() - offset
 
-		deployTimerInterval = setInterval(() => {
-			elapsedSeconds = Math.floor((Date.now() - startTime) / 1000)
+		const workerCode = `
+			let timer = null;
+			self.onmessage = (e) => {
+				if (e.data === "start") {
+					clearInterval(timer);
+					timer = setInterval(() => {
+						self.postMessage("tick");
+					}, 1000);
+				} else if (e.data === "stop") {
+					clearInterval(timer);
+				}
+			};
+		`
+		const blob = new Blob([workerCode], { type: "application/javascript" })
+		timerWorker = new Worker(URL.createObjectURL(blob))
+
+		const parserWorkerCode = `
+			let currentPhase = "preparing";
+			let currentModName = "";
+			const errorPatterns = [/.*ERROR.*?\\t/, /Error:\\s*(.*)/, /uncaughtException/, /unhandledRejection/];
+
+			self.onmessage = (e) => {
+				const { newLines, existingWarnings } = e.data;
+				let hasError = false;
+				let errorMessage = "";
+				const newlyDiscoveredWarnings = [];
+				const newlyAnalyzedMods = [];
+				const newlyDeployedMods = [];
+
+				for (const line of newLines) {
+					const cleanLine = line.trim();
+					const stripped = cleanLine.replace(/[\\u001b\\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, "");
+
+					// 1. Error detection
+					for (const pattern of errorPatterns) {
+						if (line.match(pattern)) {
+							hasError = true;
+							errorMessage = line.replace(/.*(ERROR.*?\\t|Error:\\s*)/, "").trim();
+							break;
+						}
+					}
+
+					// 2. Warnings parsing
+					if (line.match(/.*WARN.*?\\t/)) {
+						const warning = line.replace(/.*WARN.*?\\t/, "").trim();
+						if (!existingWarnings.includes(warning) && !newlyDiscoveredWarnings.includes(warning)) {
+							newlyDiscoveredWarnings.push(warning);
+						}
+					}
+
+					// 3. Progress tracking
+					const discoveringMatch = stripped.match(/Discovering mod:\\s*(.*)/);
+					const analyzingMatch = stripped.match(/Analysing framework mod:\\s*(.*)/);
+					const stagingMatch = stripped.match(/Staging RPKG mod:\\s*(.*)/);
+					const deployingMatch = stripped.match(/Deploying\\s*(.*)/);
+					const writingMatch = stripped.match(/(Writing packagedefinition|Writing chunk|Generating ORES|Rebuilding)/);
+
+					if (discoveringMatch) {
+						currentPhase = "preparing";
+						currentModName = discoveringMatch[1].trim();
+					} else if (analyzingMatch) {
+						currentPhase = "analyzing";
+						const modName = analyzingMatch[1].trim();
+						newlyAnalyzedMods.push(modName);
+						currentModName = modName;
+					} else if (stagingMatch) {
+						currentPhase = "deploying";
+						const modName = stagingMatch[1].trim();
+						newlyDeployedMods.push(modName);
+						currentModName = modName;
+					} else if (deployingMatch) {
+						currentPhase = "deploying";
+						const modName = deployingMatch[1].trim();
+						newlyDeployedMods.push(modName);
+						currentModName = modName;
+					} else if (writingMatch) {
+						currentPhase = "finalizing";
+					}
+				}
+
+				self.postMessage({
+					hasError,
+					errorMessage,
+					newlyDiscoveredWarnings,
+					newlyAnalyzedMods,
+					newlyDeployedMods,
+					currentPhase,
+					currentModName
+				});
+			};
+		`
+		const parserBlob = new Blob([parserWorkerCode], { type: "application/javascript" })
+		parserWorker = new Worker(URL.createObjectURL(parserBlob))
+
+		const updateTimer = () => {
+			const elapsedMs = performance.now() - startPerformanceTime
+			elapsedSeconds = Math.max(0, Math.floor(elapsedMs / 1000))
 			const m = Math.floor(elapsedSeconds / 60)
 			const s = elapsedSeconds % 60
 			elapsedTimeStr = m > 0 ? `${m}m ${s}s` : `${s}s`
-		}, 1000)
+		}
+
+		updateTimer()
+
+		timerWorker.onmessage = (e) => {
+			if (e.data === "tick") {
+				updateTimer()
+			}
+		}
+
+		parserWorker.onmessage = (e) => {
+			const {
+				hasError: workerHasError,
+				errorMessage: workerErrorMessage,
+				newlyDiscoveredWarnings,
+				newlyAnalyzedMods,
+				newlyDeployedMods,
+				currentPhase: workerCurrentPhase,
+				currentModName: workerCurrentModName
+			} = e.data
+
+			if (workerHasError) {
+				hasError = true
+				errorMessage = workerErrorMessage
+				stopDeployTimer()
+			}
+
+			if (newlyDiscoveredWarnings.length > 0) {
+				deployWarnings = [...deployWarnings, ...newlyDiscoveredWarnings]
+			}
+
+			if (newlyAnalyzedMods.length > 0) {
+				for (const mod of newlyAnalyzedMods) {
+					analyzedMods.add(mod)
+				}
+				analyzedMods = analyzedMods
+			}
+
+			if (newlyDeployedMods.length > 0) {
+				for (const mod of newlyDeployedMods) {
+					deployedMods.add(mod)
+				}
+				deployedMods = deployedMods
+			}
+
+			currentPhase = workerCurrentPhase
+			currentModName = workerCurrentModName
+
+			updateProgressAndLabels()
+		}
+
+		timerWorker.postMessage("start")
 	}
 
 	function stopDeployTimer() {
 		clearInterval(deployTimerInterval)
 		clearTimeout(autoScrollTimeout)
+		if (timerWorker) {
+			timerWorker.terminate()
+			timerWorker = null
+		}
+		if (parserWorker) {
+			parserWorker.terminate()
+			parserWorker = null
+		}
+	}
+
+	function updateProgressAndLabels() {
+		totalMods = enabledMods.length
+		stagedCount = deployedMods.size
+
+		if (hasError) {
+			// Stay in error state
+		} else if (deployFinished) {
+			progressPercent = 100
+			statusLabel = "Deployment completed successfully!"
+		} else if (totalMods > 0) {
+			if (currentPhase === "preparing") {
+				progressPercent = Math.min(10, Math.round((totalLinesCount / 50) * 10))
+				statusLabel = `Preparing deployment... (${currentModName})`
+			} else if (currentPhase === "analyzing") {
+				const fraction = totalMods > 0 ? analyzedMods.size / totalMods : 0
+				progressPercent = Math.round(10 + fraction * 30)
+				statusLabel = `Analyzing mod: ${currentModName} (${analyzedMods.size}/${totalMods})`
+			} else if (currentPhase === "deploying") {
+				const fraction = totalMods > 0 ? deployedMods.size / totalMods : 0
+				progressPercent = Math.round(40 + fraction * 50)
+				statusLabel = `Deploying mod: ${currentModName} (${deployedMods.size}/${totalMods})`
+			} else if (currentPhase === "finalizing") {
+				progressPercent = 95
+				statusLabel = "Finalizing deployment..."
+			}
+		} else {
+			progressPercent = 0
+			statusLabel = "Preparing deployment..."
+		}
 	}
 
 	function handleKeydown(event: KeyboardEvent) {
@@ -240,12 +449,12 @@
 		const el = e.currentTarget
 		if (!el) return
 
-		const isAtBottom = el.scrollHeight - el.clientHeight - el.scrollTop < 50
+		const isAtBottom = el.scrollHeight - el.clientHeight - el.scrollTop < 100
 		wasAtBottom = isAtBottom
 
 		clearTimeout(autoScrollTimeout)
 		if (!isAtBottom) {
-			const delay = Math.floor(Math.random() * 10000) + 15000
+			const delay = 20000
 			autoScrollTimeout = setTimeout(() => {
 				wasAtBottom = true
 				const targetEl = document.getElementById("deployOutputElement")
@@ -259,7 +468,7 @@
 	const convertOutputToHTML = throttle(() => {
 		const el = document.getElementById("deployOutputElement")
 		if (el) {
-			wasAtBottom = el.scrollHeight - el.clientHeight - el.scrollTop < 50
+			wasAtBottom = el.scrollHeight - el.clientHeight - el.scrollTop < 100
 		} else {
 			wasAtBottom = true
 		}
@@ -272,6 +481,8 @@
 
 		const isFinal = deployFinished || hasError
 		const newChunk = deployOutput.substring(lastParsedLength)
+		let newLines: string[] = []
+
 		if (newChunk) {
 			let completeChunk = ""
 			let consumedLength = 0
@@ -295,7 +506,6 @@
 					rawLinesChunk.pop()
 				}
 
-				const newLines: string[] = []
 				for (const line of rawLinesChunk) {
 					if (line !== lastAppendedLine) {
 						newLines.push(line)
@@ -311,111 +521,21 @@
 			}
 		}
 
-		// Parse lines for warnings and errors and deduplicate consecutive identical lines
-		const rawLines = deployOutput.split(/\r?\n/)
-		const lines: string[] = []
-		for (let i = 0; i < rawLines.length; i++) {
-			if (i === 0 || rawLines[i] !== rawLines[i - 1]) {
-				lines.push(rawLines[i])
+		if (newLines.length > 0) {
+			totalLinesCount += newLines.length
+			if (parserWorker) {
+				parserWorker.postMessage({ newLines, existingWarnings: deployWarnings })
 			}
 		}
 
-		// 1. Error detection
-		const errorPatterns = [/.*ERROR.*?\t/, /Error:\s*(.*)/, /uncaughtException/, /unhandledRejection/]
+		updateProgressAndLabels()
 
-		let errorLine = ""
-		for (const pattern of errorPatterns) {
-			const found = lines.find((a) => a.match(pattern))
-			if (found) {
-				errorLine = found
-				break
-			}
-		}
-
-		if (errorLine) {
-			hasError = true
-			errorMessage = errorLine.replace(/.*(ERROR.*?\t|Error:\s*)/, "").trim()
-			stopDeployTimer()
-		}
-
-		// 2. Warnings parsing (unique list, no duplicates)
-		const warningsList = lines.filter((a) => a.match(/.*WARN.*?\t/)).map((a) => a.replace(/.*WARN.*?\t/, "").trim())
-		deployWarnings = [...new Set(warningsList)]
-
-		// 3. Progress tracking
-		let analyzedMods = new Set()
-		let deployedMods = new Set()
-		let currentModName = ""
-		let currentPhase = "preparing" // preparing, analyzing, deploying, finalizing
-
-		for (const line of lines) {
-			const cleanLine = line.trim()
-			const stripped = cleanLine.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, "")
-
-			const discoveringMatch = stripped.match(/Discovering mod:\s*(.*)/)
-			const analyzingMatch = stripped.match(/Analysing framework mod:\s*(.*)/)
-			const stagingMatch = stripped.match(/Staging RPKG mod:\s*(.*)/)
-			const deployingMatch = stripped.match(/Deploying\s*(.*)/)
-			const writingMatch = stripped.match(/(Writing packagedefinition|Writing chunk|Generating ORES|Rebuilding)/)
-
-			if (discoveringMatch) {
-				currentPhase = "preparing"
-				currentModName = discoveringMatch[1].trim()
-			} else if (analyzingMatch) {
-				currentPhase = "analyzing"
-				const modName = analyzingMatch[1].trim()
-				analyzedMods.add(modName)
-				currentModName = modName
-			} else if (stagingMatch) {
-				currentPhase = "deploying"
-				const modName = stagingMatch[1].trim()
-				deployedMods.add(modName)
-				currentModName = modName
-			} else if (deployingMatch) {
-				currentPhase = "deploying"
-				const modName = deployingMatch[1].trim()
-				deployedMods.add(modName)
-				currentModName = modName
-			} else if (writingMatch) {
-				currentPhase = "finalizing"
-			}
-		}
-
-		totalMods = enabledMods.length
-		stagedCount = deployedMods.size
-
-		if (hasError) {
-			// Stay in error state
-		} else if (deployFinished) {
-			progressPercent = 100
-			statusLabel = "Deployment completed successfully!"
-		} else if (totalMods > 0) {
-			if (currentPhase === "preparing") {
-				progressPercent = Math.min(10, Math.round((lines.length / 50) * 10))
-				statusLabel = `Preparing deployment... (${currentModName})`
-			} else if (currentPhase === "analyzing") {
-				const fraction = totalMods > 0 ? analyzedMods.size / totalMods : 0
-				progressPercent = Math.round(10 + fraction * 30)
-				statusLabel = `Analyzing mod: ${currentModName} (${analyzedMods.size}/${totalMods})`
-			} else if (currentPhase === "deploying") {
-				const fraction = totalMods > 0 ? deployedMods.size / totalMods : 0
-				progressPercent = Math.round(40 + fraction * 50)
-				statusLabel = `Deploying mod: ${currentModName} (${deployedMods.size}/${totalMods})`
-			} else if (currentPhase === "finalizing") {
-				progressPercent = 95
-				statusLabel = "Finalizing deployment..."
-			}
-		} else {
-			progressPercent = 0
-			statusLabel = "Preparing deployment..."
-		}
-
-		setTimeout(() => {
+		tick().then(() => {
 			const el = document.getElementById("deployOutputElement")
 			if (el && wasAtBottom) {
 				el.scrollTop = el.scrollHeight
 			}
-		}, 50)
+		})
 	}, 200)
 
 	window.ipc.receive("frameworkDeployOutput", (output: string) => {
@@ -720,7 +840,7 @@
 	/**
 	 * Replaces a destination folder with a temporary source folder safely.
 	 * Backs up the destination first and rolls back if the replacement fails.
-	 * 
+	 *
 	 * @param tempSource The path to the temporary source directory.
 	 * @param destFolder The path to the destination directory.
 	 */
@@ -1227,15 +1347,14 @@
 				use:setupConsoleResizeObserver
 				class="flex-1 min-h-[25vh] min-w-[17.5rem] overflow-auto whitespace-pre-wrap bg-neutral-800 p-2 border border-neutral-700/30 rounded-sm"
 				style="font-family: 'Fira Code', 'IBM Plex Mono', 'Menlo', 'DejaVu Sans Mono', 'Bitstream Vera Sans Mono', Courier, monospace; color-scheme: dark; font-size: 0.75rem; resize: vertical; height: {consoleHeight ||
-					'35vh'}; max-height: 535px;"
+					'35vh'}; max-height: 65vh;"
 				id="deployOutputElement"
 				on:scroll={handleScroll}>{@html deployOutputHTML}</pre>
 
 			{#if deployWarnings.length > 0}
 				<div
 					class="overflow-y-auto bg-neutral-800 p-2 border border-yellow-600/40 rounded-sm text-yellow-300 text-xs flex flex-col gap-1"
-					style="width: 260px; font-family: 'Fira Code', 'IBM Plex Mono', monospace; color-scheme: dark; height: {consoleHeight ||
-						'35vh'}; min-height: 25vh; max-height: 535px; margin-left: auto;"
+					style="width: 260px; font-family: 'Fira Code', 'IBM Plex Mono', monospace; color-scheme: dark; min-height: 25vh; max-height: 65vh; margin-left: auto;"
 				>
 					<div class="font-bold border-b border-yellow-600/30 pb-1 mb-1 sticky top-0 bg-neutral-800 z-10">Warnings ({deployWarnings.length})</div>
 					{#each deployWarnings as warning, index}
@@ -1450,7 +1569,6 @@
 	>
 		<p>The mod {autoInstallModName} has been downloaded via a link - would you like to install it?</p>
 	</Modal>
-
 {/if}
 
 <style>

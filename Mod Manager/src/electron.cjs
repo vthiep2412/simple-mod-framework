@@ -23,6 +23,11 @@ const port = process.env.PORT || 3000
 const dev = !app.isPackaged
 /** @type BrowserWindow */
 let mainWindow
+const sendToWindow = (channel, ...args) => {
+	if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents) {
+		mainWindow.webContents.send(channel, ...args)
+	}
+}
 let isDeploying = false
 let deployOutput = ""
 let deployProcess = null
@@ -68,7 +73,7 @@ function createWindow() {
 
 	if (process.argv[process.argv.length - 1] && process.argv[process.argv.length - 1].startsWith("simple-mod-framework://")) {
 		mainWindow.webContents.once("did-finish-load", () => {
-			mainWindow.webContents.send("urlScheme", process.argv.pop().replace("simple-mod-framework://", ""))
+			sendToWindow("urlScheme", process.argv.pop().replace("simple-mod-framework://", ""))
 		})
 	}
 
@@ -128,7 +133,7 @@ if (!lock) {
 		}
 
 		if (commandLine[commandLine.length - 1] && commandLine[commandLine.length - 1].startsWith("simple-mod-framework://")) {
-			mainWindow.webContents.send("urlScheme", commandLine.pop().replace("simple-mod-framework://", ""))
+			sendToWindow("urlScheme", commandLine.pop().replace("simple-mod-framework://", ""))
 		}
 	})
 
@@ -151,8 +156,8 @@ if (!lock) {
 
 ipcMain.on("deploy", () => {
 	if (isDeploying) {
-		mainWindow.webContents.send("frameworkDeployModalOpen", deployStartTime)
-		mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
+		sendToWindow("frameworkDeployModalOpen", deployStartTime)
+		sendToWindow("frameworkDeployOutput", deployOutput)
 		return
 	}
 	isDeploying = true
@@ -184,9 +189,9 @@ ipcMain.on("deploy", () => {
 				const errMsg = err?.message || String(err)
 				deployOutput = isSpawnError ? `Failed to start Deploy.exe: ${errMsg}` : `Deployment failed: ${errMsg}`
 			}
-			mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
+			sendToWindow("frameworkDeployOutput", deployOutput)
 		}
-		mainWindow.webContents.send("frameworkDeployFinished")
+		sendToWindow("frameworkDeployFinished")
 	}
 
 	try {
@@ -199,16 +204,16 @@ ipcMain.on("deploy", () => {
 			cleanupDeploy(err)
 		})
 
-		mainWindow.webContents.send("frameworkDeployModalOpen", deployStartTime)
+		sendToWindow("frameworkDeployModalOpen", deployStartTime)
 
 		deployProcess.stdout.on("data", (data) => {
 			deployOutput += String(data)
-			mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
+			sendToWindow("frameworkDeployOutput", deployOutput)
 		})
 
 		deployProcess.stderr.on("data", (data) => {
 			deployOutput += String(data)
-			mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
+			sendToWindow("frameworkDeployOutput", deployOutput)
 		})
 
 		deployProcess.on("close", (code, signal) => {
@@ -225,8 +230,8 @@ ipcMain.on("deploy", () => {
 
 ipcMain.on("checkDeployStatus", () => {
 	if (isDeploying) {
-		mainWindow.webContents.send("frameworkDeployModalOpen", deployStartTime)
-		mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
+		sendToWindow("frameworkDeployModalOpen", deployStartTime)
+		sendToWindow("frameworkDeployOutput", deployOutput)
 	}
 })
 
@@ -243,7 +248,7 @@ ipcMain.on("killDeployProcess", () => {
 })
 
 ipcMain.on("modFileOpenDialog", () => {
-	mainWindow.webContents.send(
+	sendToWindow(
 		"modFileOpenDialogResult",
 		dialog.showOpenDialogSync(mainWindow, {
 			title: "Add a mod file",
@@ -255,7 +260,7 @@ ipcMain.on("modFileOpenDialog", () => {
 })
 
 ipcMain.on("runtimePackageOpenDialog", () => {
-	mainWindow.webContents.send(
+	sendToWindow(
 		"runtimePackageOpenDialogResult",
 		dialog.showOpenDialogSync(mainWindow, {
 			title: "Select an RPKG file",
@@ -267,7 +272,7 @@ ipcMain.on("runtimePackageOpenDialog", () => {
 })
 
 ipcMain.on("imageOpenDialog", () => {
-	mainWindow.webContents.send(
+	sendToWindow(
 		"imageOpenDialogResult",
 		dialog.showOpenDialogSync(mainWindow, {
 			title: "Select an image",
