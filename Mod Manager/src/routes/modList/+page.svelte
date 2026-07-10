@@ -160,20 +160,22 @@
 		totalLinesCount = 0
 	}
 
-	let consoleHeight = localStorage.getItem("console-height") || ""
-
 	let consoleObserver: ResizeObserver | null = null
 	let saveHeightTimeout: any = null
 
 	function setupConsoleResizeObserver(node: HTMLElement) {
+		const savedHeight = localStorage.getItem("console-height")
+		if (savedHeight) {
+			node.style.height = savedHeight
+		}
+
 		consoleObserver = new ResizeObserver((entries) => {
 			for (const entry of entries) {
 				const height = entry.target.style.height
-				if (height && height !== consoleHeight) {
+				if (height) {
 					clearTimeout(saveHeightTimeout)
 					saveHeightTimeout = setTimeout(() => {
 						localStorage.setItem("console-height", height)
-						consoleHeight = height
 					}, 200)
 				}
 			}
@@ -210,6 +212,7 @@
 
 	let timerWorker: Worker | null = null
 	let parserWorker: Worker | null = null
+	let rpkgStartTime = 0
 
 	function startDeployTimer(deployStartTime: number | null) {
 		if (timerWorker) {
@@ -218,6 +221,7 @@
 		if (parserWorker) {
 			parserWorker.terminate()
 		}
+		rpkgStartTime = 0
 		clearInterval(deployTimerInterval)
 		clearTimeout(autoScrollTimeout)
 		const offset = deployStartTime ? Date.now() - deployStartTime : 0
@@ -298,6 +302,14 @@
 						const modName = deployingMatch[1].trim();
 						newlyDeployedMods.push(modName);
 						currentModName = modName;
+					} else if (stripped.includes("Localising text")) {
+						currentPhase = "localising";
+					} else if (stripped.includes("Patching thumbs")) {
+						currentPhase = "patching-thumbs";
+					} else if (stripped.includes("Patching packagedefinition")) {
+						currentPhase = "patching-pd";
+					} else if (stripped.includes("Generating RPKGs")) {
+						currentPhase = "generating-rpkgs";
 					} else if (writingMatch) {
 						currentPhase = "finalizing";
 					}
@@ -330,6 +342,7 @@
 		timerWorker.onmessage = (e) => {
 			if (e.data === "tick") {
 				updateTimer()
+				updateProgressAndLabels()
 			}
 		}
 
@@ -366,6 +379,10 @@
 					deployedMods.add(mod)
 				}
 				deployedMods = deployedMods
+			}
+
+			if (workerCurrentPhase === "generating-rpkgs" && currentPhase !== "generating-rpkgs") {
+				rpkgStartTime = performance.now()
 			}
 
 			currentPhase = workerCurrentPhase
@@ -405,12 +422,42 @@
 				statusLabel = `Preparing deployment... (${currentModName})`
 			} else if (currentPhase === "analyzing") {
 				const fraction = totalMods > 0 ? analyzedMods.size / totalMods : 0
-				progressPercent = Math.round(10 + fraction * 30)
+				progressPercent = Math.round(11 + fraction * 19)
 				statusLabel = `Analyzing mod: ${currentModName} (${analyzedMods.size}/${totalMods})`
 			} else if (currentPhase === "deploying") {
 				const fraction = totalMods > 0 ? deployedMods.size / totalMods : 0
-				progressPercent = Math.round(40 + fraction * 50)
+				progressPercent = Math.round(31 + fraction * 49)
 				statusLabel = `Deploying mod: ${currentModName} (${deployedMods.size}/${totalMods})`
+			} else if (currentPhase === "localising") {
+				progressPercent = 82
+				statusLabel = "Localising text..."
+			} else if (currentPhase === "patching-thumbs") {
+				progressPercent = 85
+				statusLabel = "Patching thumbs..."
+			} else if (currentPhase === "patching-pd") {
+				progressPercent = 88
+				statusLabel = "Patching packagedefinition..."
+			} else if (currentPhase === "generating-rpkgs") {
+				statusLabel = "Generating RPKGs..."
+				if (rpkgStartTime > 0) {
+					const elapsedMs = performance.now() - rpkgStartTime
+					let durationSec = 90
+					if (totalMods <= 1) {
+						durationSec = 90
+					} else if (totalMods <= 5) {
+						durationSec = 90 + ((totalMods - 1) / 4) * 210
+					} else if (totalMods <= 10) {
+						durationSec = 300 + ((totalMods - 5) / 5) * 300
+					} else if (totalMods <= 20) {
+						durationSec = 600 + ((totalMods - 10) / 10) * 300
+					} else {
+						durationSec = 900 + (totalMods - 20) * 60
+					}
+					const ratio = Math.min(1, elapsedMs / (durationSec * 1000))
+					progressPercent = Math.round(90 + ratio * 8)
+				} else {
+					progressPercent = 90
+				}
 			} else if (currentPhase === "finalizing") {
 				progressPercent = 95
 				statusLabel = "Finalizing deployment..."
@@ -557,7 +604,11 @@
 			statusLabel = "Deployment completed successfully!"
 		} else {
 			hasError = true
-			statusLabel = "Deployment failed"
+			if (deployOutput.includes("Deploy.exe exited with code") || deployOutput.includes("Failed to start Deploy.exe")) {
+				statusLabel = "Deployment failed: deploy.exe crashed"
+			} else {
+				statusLabel = "Deployment failed"
+			}
 
 			// Kill deploy process tree to prevent process leak
 			window.ipc.send("killDeployProcess")
@@ -1309,7 +1360,7 @@
 		<p>The framework couldn't sort your mods! Ask the developer of whichever mod you most recently installed to investigate this. Also, report this to Atampy26 on Hitman Forum or Discord.</p>
 	</Modal>
 
-	<Modal passiveModal open={frameworkDeployModalOpen} modalHeading="Applying your mods" preventCloseOnClickOutside>
+	<Modal passiveModal bind:open={frameworkDeployModalOpen} modalHeading="Applying your mods" preventCloseOnClickOutside={!deployFinished && !hasError}>
 		{#if hasError}
 			<div class="mb-4">
 				<InlineNotification hideCloseButton lowContrast kind="error" title="Deployment Failed" subtitle={errorMessage} style="max-width: none; width: 100%;" />
@@ -1346,15 +1397,14 @@
 			<pre
 				use:setupConsoleResizeObserver
 				class="flex-1 min-h-[25vh] min-w-[17.5rem] overflow-auto whitespace-pre-wrap bg-neutral-800 p-2 border border-neutral-700/30 rounded-sm"
-				style="font-family: 'Fira Code', 'IBM Plex Mono', 'Menlo', 'DejaVu Sans Mono', 'Bitstream Vera Sans Mono', Courier, monospace; color-scheme: dark; font-size: 0.75rem; resize: vertical; height: {consoleHeight ||
-					'35vh'}; max-height: 65vh;"
+				style="font-family: 'Fira Code', 'IBM Plex Mono', 'Menlo', 'DejaVu Sans Mono', 'Bitstream Vera Sans Mono', Courier, monospace; color-scheme: dark; font-size: 0.75rem; resize: vertical; height: 35vh; max-height: 60vh;"
 				id="deployOutputElement"
 				on:scroll={handleScroll}>{@html deployOutputHTML}</pre>
 
 			{#if deployWarnings.length > 0}
 				<div
 					class="overflow-y-auto bg-neutral-800 p-2 border border-yellow-600/40 rounded-sm text-yellow-300 text-xs flex flex-col gap-1"
-					style="width: 260px; font-family: 'Fira Code', 'IBM Plex Mono', monospace; color-scheme: dark; min-height: 25vh; max-height: 65vh; margin-left: auto;"
+					style="width: 260px; font-family: 'Fira Code', 'IBM Plex Mono', monospace; color-scheme: dark; min-height: 25vh; max-height: 60vh; margin-left: auto;"
 				>
 					<div class="font-bold border-b border-yellow-600/30 pb-1 mb-1 sticky top-0 bg-neutral-800 z-10">Warnings ({deployWarnings.length})</div>
 					{#each deployWarnings as warning, index}
@@ -1367,7 +1417,7 @@
 			{/if}
 		</div>
 
-		{#if deployFinished}
+		{#if deployFinished || hasError}
 			<br />
 			<div class="flex gap-4 items-center">
 				{#if deployOutput

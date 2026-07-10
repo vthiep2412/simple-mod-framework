@@ -195,10 +195,17 @@ ipcMain.on("deploy", () => {
 	}
 
 	try {
-		deployProcess = spawn("Deploy.exe --doNotPause --colors", [], {
-			shell: true,
-			cwd: ".."
-		})
+		const simPath = path.join(__dirname, "..", "simulate-deploy.cjs")
+		if (dev && fs.existsSync(simPath)) {
+			deployProcess = spawn("node", [simPath], {
+				cwd: path.join(__dirname, "..")
+			})
+		} else {
+			deployProcess = spawn("Deploy.exe --doNotPause --colors", [], {
+				shell: true,
+				cwd: ".."
+			})
+		}
 
 		deployProcess.on("error", (err) => {
 			cleanupDeploy(err)
