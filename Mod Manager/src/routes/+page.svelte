@@ -15,7 +15,21 @@
 
 	import { Button, InlineLoading, Modal, ProgressBar } from "carbon-components-svelte"
 
-	import { getAllMods, getConfig, getManifestFromModID, modIsFramework, getModFolder, mergeConfig, FrameworkVersion, clearModsCache, preloadModsCache, getCacheLoadStartTimestamp, getCacheLoadStartCaller, removeDirectoryRecursive, trustedHosts } from "$lib/utils"
+	import {
+		getAllMods,
+		getConfig,
+		getManifestFromModID,
+		modIsFramework,
+		getModFolder,
+		mergeConfig,
+		FrameworkVersion,
+		clearModsCache,
+		preloadModsCache,
+		getCacheLoadStartTimestamp,
+		getCacheLoadStartCaller,
+		removeDirectoryRecursive,
+		trustedHosts
+	} from "$lib/utils"
 
 	import { v4 } from "uuid"
 	import { marked } from "marked"
@@ -46,8 +60,6 @@
 
 	let mustRedownloadFrameworkModalOpen = false
 	let installedViaZIP = false
-
-
 
 	let githubReleaseMarkdownBody = cachedReleaseMarkdownBody
 	let canAutomaticallyUpdate = cachedCanAutomaticallyUpdate
@@ -383,8 +395,6 @@
 		modUpdates = modUpdatesPromise
 	}
 
-
-
 	async function checkForModUpdates(force = false): Promise<[string, { version: string; changelog: string; url: string; check_url: string } | false][]> {
 		let modUpdateJSONs = []
 		let cachedData: Record<string, any> = {}
@@ -613,8 +623,8 @@
 	}
 </script>
 
-<div class="w-full h-full overflow-y-auto flex items-center justify-center gap-96">
-	<div>
+<div class="w-full h-full overflow-y-auto flex items-start justify-center py-16 gap-96">
+	<div class="w-[900px] max-w-full px-4">
 		<h1 in:fade>Welcome to the Simple Mod Framework</h1>
 		<br />
 		<div class="inline" in:fade={{ delay: 400 }}>
@@ -811,7 +821,8 @@
 
 <Modal alert bind:open={mustRedownloadFrameworkModalOpen} modalHeading="Reinstall the Mod Manager" primaryButtonText="OK" on:submit={() => (mustRedownloadFrameworkModalOpen = false)}>
 	<p>
-		The framework's Mod Manager needs to be reinstalled due to a change in its internals which can't be automatically updated. Please delete your Mod Manager folder, download the Release.zip file from
+		The framework's Mod Manager needs to be reinstalled due to a change in its internals which can't be automatically updated. Please delete your Mod Manager folder, download the Release.zip file
+		from
 		<code>https://github.com/atampy25/simple-mod-framework/releases/latest</code>
 		and extract the new Mod Manager folder from the ZIP.
 	</p>

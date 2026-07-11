@@ -26,7 +26,9 @@
 			const targetId = manifest.id
 			validationTimeout = setTimeout(() => {
 				if (isFrameworkMod && manifest && manifest.id === targetId) {
-					modValidation = validateModFolder(getModFolder(targetId))
+					validateModFolder(getModFolder(targetId)).then((res) => {
+						modValidation = res
+					})
 				}
 			}, 0)
 		} else {

@@ -80,7 +80,9 @@
 	let modValidation: [boolean, string] = [true, ""]
 
 	$: if (cacheLoaded && $page.params.mod && manifest && manifest.id) {
-		modValidation = validateModFolder(getModFolder(manifest.id))
+		validateModFolder(getModFolder(manifest.id)).then((res) => {
+			modValidation = res
+		})
 	}
 </script>
 

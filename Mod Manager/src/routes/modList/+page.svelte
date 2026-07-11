@@ -4,7 +4,7 @@
 	import { onMount, tick } from "svelte"
 
 	import json5 from "json5"
-	import { Button, CodeSnippet, InlineNotification, Modal, ProgressBar, Search, InlineLoading } from "carbon-components-svelte"
+	import { Button, CodeSnippet, InlineNotification, Modal, ProgressBar, Search, Loading } from "carbon-components-svelte"
 	import AnsiToHTML from "ansi-to-html"
 	import throttle from "lodash/throttle"
 
@@ -82,16 +82,21 @@
 	let enabledMods: { value: string }[] = []
 	let disabledMods: { value: string }[] = []
 	let cacheLoaded = false
+	let showBuildingCache = false
 	let deleteModModalOpen = false
 	let deleteModInProgress: string
 	let forceModListsUpdate = Math.random()
 
 	onMount(async () => {
+		const timer = setTimeout(() => {
+			showBuildingCache = true
+		}, 1500)
 		try {
 			await preloadModsCache("modList")
 		} catch (e) {
 			console.error("Failed to preload mods cache on mount:", e)
 		} finally {
+			clearTimeout(timer)
 			cacheLoaded = true
 			window.ipc.send("checkDeployStatus")
 		}
@@ -791,7 +796,7 @@
 									continue
 								}
 
-								const modValidation = validateModFolder(modFolder)
+								const modValidation = await validateModFolder(modFolder)
 								if (!modValidation[0]) {
 									status = "invalid"
 									errors.push(`Validation failed for "${manifest.name || a}": ${modValidation[1]}`)
@@ -1170,8 +1175,11 @@
 <svelte:window on:keydown={handleKeydown} />
 
 {#if !cacheLoaded}
-	<div class="flex flex-col items-center justify-center h-full w-full gap-4">
-		<InlineLoading description="Loading mods cache..." />
+	<div class="flex flex-col items-center justify-center h-[80vh] w-full gap-4">
+		<Loading withOverlay={false} />
+		<span class="text-gray-400 text-sm">
+			{showBuildingCache ? "Building cache..." : "Loading mods cache..."}
+		</span>
 	</div>
 {:else}
 	<div class="grid grid-cols-2 gap-4 w-full mb-16">

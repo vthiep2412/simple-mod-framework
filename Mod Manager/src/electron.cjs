@@ -6,6 +6,7 @@ const serve = require("electron-serve")
 const { spawn, execSync } = require("child_process")
 const fs = require("fs")
 const path = require("path")
+const json5 = require("json5")
 
 try {
 	require("electron-reloader")(module, {
@@ -153,6 +154,125 @@ if (!lock) {
 		if (process.platform !== "darwin") app.quit()
 	})
 }
+
+const fsPromises = fs.promises
+
+async function getJsonFilesAsync(dir, visited = new Set()) {
+	let results = []
+	try {
+		const realDir = await fsPromises.realpath(dir)
+		if (visited.has(realDir)) return results
+		visited.add(realDir)
+
+		const list = await fsPromises.readdir(realDir, { withFileTypes: true })
+		for (const file of list) {
+			const res = path.resolve(realDir, file.name)
+			if (file.isDirectory()) {
+				results.push(...(await getJsonFilesAsync(res, visited)))
+			} else if (
+				file.name.endsWith("entity.json") ||
+				file.name.endsWith("entity.patch.json") ||
+				file.name.endsWith("repository.json") ||
+				file.name.endsWith("unlockables.json") ||
+				file.name.endsWith("JSON.patch.json") ||
+				file.name.endsWith("contract.json")
+			) {
+				results.push(res)
+			}
+		}
+	} catch {}
+	return results
+}
+
+ipcMain.handle("get-mod-stats", async (event, modFolder) => {
+	try {
+		const manifestPath = path.join(modFolder, "manifest.json")
+		try {
+			await fsPromises.access(manifestPath)
+		} catch {
+			return {
+				statsParts: [`${manifestPath}:missing`],
+				manifest: null,
+				contentFoldersStatus: {},
+				jsonFilesData: {}
+			}
+		}
+
+		const filesToStat = [manifestPath]
+		let manifest = null
+		const contentFoldersStatus = {}
+
+		try {
+			const manifestContent = await fsPromises.readFile(manifestPath, "utf8")
+			manifest = json5.parse(manifestContent)
+
+			const contentDirs = [
+				...(manifest.contentFolders || []),
+				...(manifest.options || []).flatMap((opt) => opt.contentFolders || [])
+			]
+			for (const dir of contentDirs) {
+				const fullPath = path.resolve(modFolder, dir)
+				try {
+					await fsPromises.access(fullPath)
+					contentFoldersStatus[dir] = true
+					filesToStat.push(fullPath)
+				} catch {
+					contentFoldersStatus[dir] = false
+				}
+			}
+
+			const blobsDirs = [
+				...(manifest.blobsFolders || []),
+				...(manifest.options || []).flatMap((opt) => opt.blobsFolders || [])
+			]
+			for (const dir of blobsDirs) {
+				const fullPath = path.resolve(modFolder, dir)
+				try {
+					await fsPromises.access(fullPath)
+					filesToStat.push(fullPath)
+				} catch {}
+			}
+		} catch {}
+
+		const jsonFilesData = {}
+		try {
+			const klawFiles = await getJsonFilesAsync(modFolder)
+			filesToStat.push(...klawFiles)
+
+			for (const file of klawFiles) {
+				try {
+					const content = await fsPromises.readFile(file, "utf8")
+					jsonFilesData[file] = content
+				} catch {}
+			}
+		} catch {}
+
+		const statsParts = await Promise.all(
+			filesToStat.map(async (file) => {
+				try {
+					const stat = await fsPromises.stat(file)
+					return `${file}:${stat.mtimeMs}:${stat.size}`
+				} catch {
+					return `${file}:missing`
+				}
+			})
+		)
+
+		return {
+			statsParts,
+			manifest,
+			contentFoldersStatus,
+			jsonFilesData
+		}
+	} catch {
+		return {
+			statsParts: [],
+			manifest: null,
+			contentFoldersStatus: {},
+			jsonFilesData: {}
+		}
+	}
+})
 
 ipcMain.on("deploy", () => {
 	if (isDeploying) {

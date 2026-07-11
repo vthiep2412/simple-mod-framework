@@ -1,15 +1,7 @@
 import { OptionType, type Config, type Manifest } from "../../../src/types"
 import { compileExpression, useDotAccessOperatorAndOptionalChaining } from "filtrex"
 
-import Ajv from "ajv"
 import json5 from "json5"
-import manifestSchema from "$lib/manifest-schema.json"
-import entitySchema from "$lib/entity-schema.json"
-import entityPatchSchema from "$lib/entity-patch-schema.json"
-import repositorySchema from "$lib/repository-schema.json"
-import unlockablesSchema from "$lib/unlockables-schema.json"
-import contractSchema from "$lib/contract-schema.json"
-import jsonPatchSchema from "$lib/json-patch-schema.json"
 import merge from "lodash.mergewith"
 import semver from "semver"
 import { writable } from "svelte/store"
@@ -27,14 +19,53 @@ const manifestsMap = new Map<string, Manifest>()
 const foldersMap = new Map<string, string>()
 const isFrameworkMap = new Map<string, boolean>()
 
-const validateManifest = new Ajv({ strict: false }).compile(manifestSchema)
+// @ts-expect-error Vite worker query type definitions
+import ValidationWorker from "./validation.worker?worker"
 
-const validateEntity = new Ajv({ strict: false }).compile(entitySchema)
-const validateEntityPatch = new Ajv({ strict: false }).compile(entityPatchSchema)
-const validateRepository = new Ajv({ strict: false }).compile(repositorySchema)
-const validateUnlockables = new Ajv({ strict: false }).compile(unlockablesSchema)
-const validateContract = new Ajv({ strict: false }).compile(contractSchema)
-const validateJSONPatch = new Ajv({ strict: false }).compile(jsonPatchSchema)
+let worker: Worker | null = null
+let currentWorkerId = 0
+const pendingResolvers = new Map<number, (res: [boolean, string]) => void>()
+
+function getWorker(): Worker {
+	if (!worker) {
+		worker = new ValidationWorker()
+		worker.onmessage = (event) => {
+			const { id, result } = event.data
+			const resolver = pendingResolvers.get(id)
+			if (resolver) {
+				resolver(result)
+				pendingResolvers.delete(id)
+			}
+		}
+		worker.onerror = (error) => {
+			console.error("Validation worker error:", error)
+			for (const [id, resolver] of pendingResolvers.entries()) {
+				resolver([false, "Validation worker crashed"])
+				pendingResolvers.delete(id)
+			}
+		}
+	}
+	return worker
+}
+
+function validateInWorker(
+	modFolder: string,
+	manifest: any,
+	contentFoldersStatus: Record<string, boolean>,
+	jsonFilesData: Record<string, string>
+): Promise<[boolean, string]> {
+	const id = ++currentWorkerId
+	return new Promise((resolve) => {
+		pendingResolvers.set(id, resolve)
+		getWorker().postMessage({
+			id,
+			modFolder,
+			manifest,
+			contentFoldersStatus,
+			jsonFilesData
+		})
+	})
+}
 
 export function validateConfigOptions(config: Config) {
 	if (!modsCacheInitialized) {
@@ -426,51 +457,57 @@ export function preloadModsCache(caller?: string, force = false): Promise<void> 
 			const tempFoldersMap = new Map<string, string>()
 			const tempIsFrameworkMap = new Map<string, boolean>()
 
-			await Promise.all(
-				subdirs.map(async (subdir) => {
-					if (subdir === "Managed by SMF, do not touch") {
-						return
-					}
+			for (const subdir of subdirs) {
+				if (subdir === "Managed by SMF, do not touch") {
+					continue
+				}
 
-					const fullPath = window.path.resolve(window.path.join(modsDir, subdir))
-					const manifestPath = window.path.join(fullPath, "manifest.json")
+				const fullPath = window.path.resolve(window.path.join(modsDir, subdir))
+				const manifestPath = window.path.join(fullPath, "manifest.json")
 
-					if (await window.fs.pathExists(manifestPath)) {
-						try {
-							const manifestContent = await window.fs.readFile(manifestPath, "utf8")
-							const manifest = json5.parse(String(manifestContent)) as Manifest
-							const id = manifest.id
-							if (id) {
-								tempModsList.push(id)
-								tempManifestsMap.set(id, manifest)
-								tempFoldersMap.set(id, fullPath)
-								tempIsFrameworkMap.set(id, true)
+				if (await window.fs.pathExists(manifestPath)) {
+					try {
+						const manifestContent = await window.fs.readFile(manifestPath, "utf8")
+						const manifest = json5.parse(String(manifestContent)) as Manifest
+						const id = manifest.id
+						if (id) {
+							tempModsList.push(id)
+							tempManifestsMap.set(id, manifest)
+							tempFoldersMap.set(id, fullPath)
+							tempIsFrameworkMap.set(id, true)
 
-								if (id !== subdir) {
-									tempManifestsMap.set(subdir, manifest)
-									tempFoldersMap.set(subdir, fullPath)
-									tempIsFrameworkMap.set(subdir, true)
-								}
-							} else {
-								const idFallback = subdir
-								tempModsList.push(idFallback)
-								tempFoldersMap.set(idFallback, fullPath)
-								tempIsFrameworkMap.set(idFallback, false)
+							if (id !== subdir) {
+								tempManifestsMap.set(subdir, manifest)
+								tempFoldersMap.set(subdir, fullPath)
+								tempIsFrameworkMap.set(subdir, true)
 							}
-						} catch {
+						} else {
 							const idFallback = subdir
 							tempModsList.push(idFallback)
 							tempFoldersMap.set(idFallback, fullPath)
 							tempIsFrameworkMap.set(idFallback, false)
 						}
-					} else {
-						const id = subdir
-						tempModsList.push(id)
-						tempFoldersMap.set(id, fullPath)
-						tempIsFrameworkMap.set(id, false)
+					} catch {
+						const idFallback = subdir
+						tempModsList.push(idFallback)
+						tempFoldersMap.set(idFallback, fullPath)
+						tempIsFrameworkMap.set(idFallback, false)
 					}
-				})
-			)
+				} else {
+					const id = subdir
+					tempModsList.push(id)
+					tempFoldersMap.set(id, fullPath)
+					tempIsFrameworkMap.set(id, false)
+				}
+
+				try {
+					await validateModFolder(fullPath)
+				} catch (e) {
+					console.error(`Validation failed for subdir: ${subdir}`, e)
+				}
+
+				await new Promise((resolve) => setTimeout(resolve, 0))
+			}
 
 			if (currentGeneration !== cacheGeneration) {
 				await cacheLoadingPromise
@@ -680,8 +717,8 @@ export function clearValidationCacheForFolder(modFolder: string) {
 	validationCache.delete(modFolder)
 	validationCache.delete(resolvedFolder)
 
-	const prefix1 = `val-cache:${window.path.join(modFolder, "manifest.json")}:`
-	const prefix2 = `val-cache:${window.path.join(resolvedFolder, "manifest.json")}:`
+	const prefix1 = `val-cache:${window.path.join(modFolder, "manifest.json")}`
+	const prefix2 = `val-cache:${window.path.join(resolvedFolder, "manifest.json")}`
 
 	for (let i = localStorage.length - 1; i >= 0; i--) {
 		const key = localStorage.key(i)
@@ -691,67 +728,12 @@ export function clearValidationCacheForFolder(modFolder: string) {
 	}
 }
 
-export function validateModFolder(modFolder: string): [boolean, string] {
-	if (validationCache.has(modFolder)) {
-		return validationCache.get(modFolder)!
-	}
+let validationQueue = Promise.resolve()
 
+async function runValidationAsync(modFolder: string): Promise<[boolean, string]> {
 	try {
 		const manifestPath = window.path.join(modFolder, "manifest.json")
-		if (!window.fs.existsSync(manifestPath)) {
-			const result: [boolean, string] = [false, "No manifest"]
-			validationCache.set(modFolder, result)
-			return result
-		}
-
-		const filesToStat = [manifestPath]
-		try {
-			const manifestContent = window.fs.readFileSync(manifestPath, "utf8")
-			const manifest = json5.parse(manifestContent)
-			const contentDirs = [
-				...(manifest.contentFolders || []),
-				...(manifest.options || []).flatMap((opt: { contentFolders?: string[] }) => opt.contentFolders || [])
-			]
-			for (const dir of contentDirs) {
-				const fullPath = window.path.resolve(modFolder, dir)
-				if (window.fs.existsSync(fullPath)) {
-					filesToStat.push(fullPath)
-				}
-			}
-			const blobsDirs = [
-				...(manifest.blobsFolders || []),
-				...(manifest.options || []).flatMap((opt: { blobsFolders?: string[] }) => opt.blobsFolders || [])
-			]
-			for (const dir of blobsDirs) {
-				const fullPath = window.path.resolve(modFolder, dir)
-				if (window.fs.existsSync(fullPath)) {
-					filesToStat.push(fullPath)
-				}
-			}
-		} catch {}
-
-		try {
-			const klawFiles = window.klaw(modFolder, { nodir: true })
-				.map((a) => a.path)
-				.filter((file) =>
-					file.endsWith("entity.json") ||
-					file.endsWith("entity.patch.json") ||
-					file.endsWith("repository.json") ||
-					file.endsWith("unlockables.json") ||
-					file.endsWith("JSON.patch.json") ||
-					file.endsWith("contract.json")
-				)
-			filesToStat.push(...klawFiles)
-		} catch {}
-
-		const statsParts = filesToStat.map((file) => {
-			try {
-				const stat = window.fs.statSync(file)
-				return `${file}:${stat.mtimeMs}:${stat.size}`
-			} catch {
-				return `${file}:missing`
-			}
-		})
+		const { statsParts, manifest, contentFoldersStatus, jsonFilesData } = await window.ipc.invoke("get-mod-stats", modFolder)
 		const cacheKey = `val-cache:${statsParts.join("|")}`
 
 		const cached = localStorage.getItem(cacheKey)
@@ -761,11 +743,12 @@ export function validateModFolder(modFolder: string): [boolean, string] {
 			return result
 		}
 
-		const result = performValidation(modFolder)
+		// Validate in Web Worker background thread
+		const result = await validateInWorker(modFolder, manifest, contentFoldersStatus, jsonFilesData)
 		validationCache.set(modFolder, result)
 
 		// Evict older cache entries for this mod to prevent orphaned keys
-		const prefix = `val-cache:${manifestPath}:`
+		const prefix = `val-cache:${manifestPath}`
 		for (let i = localStorage.length - 1; i >= 0; i--) {
 			const key = localStorage.key(i)
 			if (key?.startsWith(prefix)) {
@@ -776,122 +759,29 @@ export function validateModFolder(modFolder: string): [boolean, string] {
 		localStorage.setItem(cacheKey, JSON.stringify(result))
 		return result
 	} catch {
-		const result = performValidation(modFolder)
+		const result: [boolean, string] = [false, "Validation crashed"]
 		validationCache.set(modFolder, result)
 		return result
 	}
 }
 
-// skipcq: JS-R1005
-function performValidation(modFolder: string): [boolean, string] {
-	if (!window.fs.existsSync(window.path.join(modFolder, "manifest.json"))) {
-		return [false, "No manifest"]
+export function validateModFolder(modFolder: string): Promise<[boolean, string]> {
+	if (validationCache.has(modFolder)) {
+		return Promise.resolve(validationCache.get(modFolder)!)
 	}
 
-	try {
-		json5.parse(window.fs.readFileSync(window.path.join(modFolder, "manifest.json"), "utf8"))
-	} catch {
-		return [false, "Invalid manifest due to invalid JSON"]
-	}
-
-	if (!validateManifest(json5.parse(window.fs.readFileSync(window.path.join(modFolder, "manifest.json"), "utf8")))) {
-		return [false, `Invalid manifest due to non-matching schema: ${new Ajv({ strict: false }).errorsText(validateManifest.errors)}`]
-	}
-
-	const manifest: Manifest = json5.parse(window.fs.readFileSync(window.path.join(modFolder, "manifest.json"), "utf8"))
-
-	for (const contentFolder of [...(manifest.contentFolders || []), ...(manifest.options || []).flatMap((a) => a.contentFolders || [])]) {
-		if (!window.fs.existsSync(window.path.resolve(modFolder, contentFolder))) {
-			return [false, `Invalid content folder "${contentFolder}" due to nonexistent path`]
+	const promise = validationQueue.then(async () => {
+		// In case it was validated while waiting in queue
+		if (validationCache.has(modFolder)) {
+			return validationCache.get(modFolder)!
 		}
+		return runValidationAsync(modFolder)
+	})
 
-		const chunkFolders = window.fs.readdirSync(window.path.resolve(modFolder, contentFolder))
+	// Advance the queue
+	validationQueue = promise.then(() => {}).catch(() => {})
 
-		if (chunkFolders.length === 0) {
-			return [false, `Empty content folder "${contentFolder}"`]
-		}
-
-		for (const chunkFolder of chunkFolders) {
-			if (!chunkFolder.match(/chunk([0-9]*)/)) {
-				return [false, `Invalid chunk folder "${chunkFolder}" in "${contentFolder}"`]
-			}
-		}
-	}
-
-	for (const blobsFolder of [...(manifest.blobsFolders || []), ...(manifest.options || []).flatMap((a) => a.blobsFolders || [])]) {
-		if (!window.fs.existsSync(window.path.resolve(modFolder, blobsFolder))) {
-			return [false, `Invalid blobs folder "${blobsFolder}" due to nonexistent path`]
-		}
-
-		if (window.fs.readdirSync(window.path.resolve(modFolder, blobsFolder)).length === 0) {
-			return [false, `Empty blobs folder "${blobsFolder}"`]
-		}
-	}
-
-	const groups: Record<string, [number, number]> = {}
-
-	for (const option of manifest.options || []) {
-		if (option.type === OptionType.select) {
-			groups[option.group] ??= [0, 0]
-			groups[option.group][0] = groups[option.group][0] + 1
-
-			if (option.enabledByDefault) {
-				groups[option.group][1] = groups[option.group][1] + 1
-			}
-		}
-	}
-
-	for (const [group, [members, enabledByDefault]] of Object.entries(groups)) {
-		if (members === 1) {
-			return [false, `Option group "${group}" has only one member`]
-		}
-
-		if (enabledByDefault > 1) {
-			return [false, `Option group "${group}" has more than one member enabled by default`]
-		}
-	}
-
-	for (const file of window.klaw(modFolder, { nodir: true }).map((a) => a.path)) {
-		if (
-			file.endsWith("entity.json") ||
-			file.endsWith("entity.patch.json") ||
-			file.endsWith("repository.json") ||
-			file.endsWith("unlockables.json") ||
-			file.endsWith("JSON.patch.json") ||
-			file.endsWith("contract.json")
-		) {
-			try {
-				const fileContents = window.fs.readJSONSync(file)
-
-				switch (file.split(".").slice(1).join(".")) {
-					case "entity.json":
-						if (fileContents.quickEntityVersion === 3.1 && !validateEntity(fileContents))
-							return [false, `Invalid file ${file} due to non-matching schema: ${new Ajv({ strict: false }).errorsText(validateEntity.errors)}`]
-						break
-					case "entity.patch.json":
-						if (fileContents.patchVersion === 6 && !validateEntityPatch(fileContents))
-							return [false, `Invalid file ${file} due to non-matching schema: ${new Ajv({ strict: false }).errorsText(validateEntityPatch.errors)}`]
-						break
-					case "repository.json":
-						if (!validateRepository(fileContents)) return [false, `Invalid file ${file} due to non-matching schema: ${new Ajv({ strict: false }).errorsText(validateRepository.errors)}`]
-						break
-					case "unlockables.json":
-						if (!validateUnlockables(fileContents)) return [false, `Invalid file ${file} due to non-matching schema: ${new Ajv({ strict: false }).errorsText(validateUnlockables.errors)}`]
-						break
-					case "contract.json":
-						if (!validateContract(fileContents)) return [false, `Invalid file ${file} due to non-matching schema: ${new Ajv({ strict: false }).errorsText(validateContract.errors)}`]
-						break
-					case "JSON.patch.json":
-						if (!validateJSONPatch(fileContents)) return [false, `Invalid file ${file} due to non-matching schema: ${new Ajv({ strict: false }).errorsText(validateJSONPatch.errors)}`]
-						break
-				}
-			} catch {
-				return [false, `Invalid file ${file} due to invalid JSON`]
-			}
-		}
-	}
-
-	return [true, ""]
+	return promise
 }
 
 export async function removeDirectoryRecursive(dirPath: string) {

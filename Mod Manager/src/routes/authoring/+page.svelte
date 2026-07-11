@@ -2,19 +2,24 @@
 	import { scale } from "svelte/transition"
 	import { onMount } from "svelte"
 
-	import { Button, Tile, Truncate, InlineLoading } from "carbon-components-svelte"
+	import { Button, Tile, Truncate, Loading } from "carbon-components-svelte"
 	import { getAllMods, getManifestFromModID, modIsFramework, preloadModsCache } from "$lib/utils"
 	import Edit from "carbon-icons-svelte/lib/Edit.svelte"
 	import { goto } from "$app/navigation"
 
 	let cacheLoaded = false
+	let showBuildingCache = false
 
 	onMount(async () => {
+		const timer = setTimeout(() => {
+			showBuildingCache = true
+		}, 1500)
 		try {
 			await preloadModsCache("authoring")
 		} catch (err) {
 			console.error("Failed to load mods cache for authoring:", err)
 		} finally {
+			clearTimeout(timer)
 			cacheLoaded = true
 		}
 	})
@@ -31,8 +36,11 @@
 <br />
 
 {#if !cacheLoaded}
-	<div class="flex flex-col items-center justify-center h-full w-full gap-4 mt-8">
-		<InlineLoading description="Loading mods cache..." />
+	<div class="flex flex-col items-center justify-center h-[80vh] w-full gap-4 mt-8">
+		<Loading withOverlay={false} />
+		<span class="text-gray-400 text-sm">
+			{showBuildingCache ? "Building cache..." : "Loading mods cache..."}
+		</span>
 	</div>
 {:else}
 	<div class="mt-4 {window.screen.height <= 1080 ? 'h-[82vh]' : 'h-[85vh]'} pr-4 overflow-y-auto">
