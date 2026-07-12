@@ -26,3 +26,10 @@ temp/
 staging/
 .vscode/
 Mod Manager/simulate-deploy.cjs
+*patchWorker*/*
+*patchWorker*
+Third-Party/rpkg-cli.exe
+Third-Party/quickentity_ffi.dll
+Third-Party/hash_list.hmla
+Third-Party/assimp.dll
+Deploy.log

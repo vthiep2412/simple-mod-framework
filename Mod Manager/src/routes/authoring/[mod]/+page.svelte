@@ -80,7 +80,21 @@
 	let modValidation: [boolean, string] = [true, ""]
 
 	$: if (cacheLoaded && $page.params.mod && manifest && manifest.id) {
-		modValidation = validateModFolder(getModFolder(manifest.id))
+		const targetMod = $page.params.mod
+		const targetId = manifest.id
+		try {
+			validateModFolder(getModFolder(targetId))
+				.then((res) => {
+					if (cacheLoaded && $page.params.mod === targetMod && manifest && manifest.id === targetId) {
+						modValidation = res
+					}
+				})
+				.catch((err) => {
+					console.error("Failed to validate mod folder:", err)
+				})
+		} catch (err) {
+			console.error("Failed to get mod folder:", err)
+		}
 	}
 </script>
 

@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { scale, fade } from "svelte/transition"
 	import { flip } from "svelte/animate"
-	import { onMount, tick } from "svelte"
+	import { onMount, tick, onDestroy } from "svelte"
 
 	import json5 from "json5"
-	import { Button, CodeSnippet, InlineNotification, Modal, ProgressBar, Search, InlineLoading } from "carbon-components-svelte"
+	import { Button, CodeSnippet, InlineNotification, Modal, ProgressBar, Search, Loading } from "carbon-components-svelte"
 	import AnsiToHTML from "ansi-to-html"
 	import throttle from "lodash/throttle"
 
@@ -54,7 +54,7 @@
 	} from "$lib/utils"
 	import Mod from "$lib/Mod.svelte"
 	import TextInputModal from "$lib/TextInputModal.svelte"
-	import { goto } from "$app/navigation"
+	import { goto, beforeNavigate } from "$app/navigation"
 
 	import AddIcon from "carbon-icons-svelte/lib/Add.svelte"
 	import AddAltIcon from "carbon-icons-svelte/lib/AddAlt.svelte"
@@ -78,23 +78,31 @@
 	import { OptionType } from "../../../../src/types"
 	import { page } from "$app/stores"
 	import SortableList from "$lib/SortableList.svelte"
+	import CacheLoading from "$lib/CacheLoading.svelte"
 
 	let enabledMods: { value: string }[] = []
 	let disabledMods: { value: string }[] = []
 	let cacheLoaded = false
+	let cacheLoadError = ""
 	let deleteModModalOpen = false
 	let deleteModInProgress: string
 	let forceModListsUpdate = Math.random()
 
-	onMount(async () => {
+	async function preloadCache() {
+		cacheLoaded = false
+		cacheLoadError = ""
 		try {
 			await preloadModsCache("modList")
-		} catch (e) {
-			console.error("Failed to preload mods cache on mount:", e)
-		} finally {
 			cacheLoaded = true
 			window.ipc.send("checkDeployStatus")
+		} catch (e: any) {
+			console.error("Failed to preload mods cache on mount:", e)
+			cacheLoadError = e?.message || "Failed to load mods cache."
 		}
+	}
+
+	onMount(() => {
+		preloadCache()
 	})
 
 	$: if (cacheLoaded) {
@@ -153,18 +161,30 @@
 		lastAppendedLine = ""
 		deployOutputHTML = ""
 		deployWarnings = []
+		analyzedMods = new Set()
+		deployedMods = new Set()
+		currentModName = ""
+		currentPhase = "preparing"
+		totalLinesCount = 0
 	}
 
-	let consoleHeight = localStorage.getItem("console-height") || ""
-
 	let consoleObserver: ResizeObserver | null = null
+	let saveHeightTimeout: any = null
+
 	function setupConsoleResizeObserver(node: HTMLElement) {
+		const savedHeight = localStorage.getItem("console-height")
+		if (savedHeight) {
+			node.style.height = savedHeight
+		}
+
 		consoleObserver = new ResizeObserver((entries) => {
 			for (const entry of entries) {
 				const height = entry.target.style.height
-				if (height && height !== consoleHeight) {
-					localStorage.setItem("console-height", height)
-					consoleHeight = height
+				if (height) {
+					clearTimeout(saveHeightTimeout)
+					saveHeightTimeout = setTimeout(() => {
+						localStorage.setItem("console-height", height)
+					}, 200)
 				}
 			}
 		})
@@ -174,6 +194,7 @@
 				if (consoleObserver) {
 					consoleObserver.disconnect()
 				}
+				clearTimeout(saveHeightTimeout)
 			}
 		}
 	}
@@ -190,26 +211,322 @@
 	let totalMods = 0
 	let stagedCount = 0
 
-	function startDeployTimer(deployStartTime) {
+	let analyzedMods = new Set()
+	let deployedMods = new Set()
+	let currentModName = ""
+	let currentPhase = "preparing"
+	let startPerformanceTime = 0
+	let totalLinesCount = 0
+
+	let timerWorker: Worker | null = null
+	let parserWorker: Worker | null = null
+	let rpkgStartTime = 0
+
+	function parseLogs(newLines: string[], existingWarnings: string[], initialPhase: string, initialModName: string) {
+		const errorPatterns = [/.*ERROR.*?\t/, /Error:\s*(.*)/, /uncaughtException/, /unhandledRejection/]
+		let currentPhase = initialPhase
+		let currentModName = initialModName
+		let hasError = false
+		let errorMessage = ""
+		const newlyDiscoveredWarnings: string[] = []
+		const newlyAnalyzedMods: string[] = []
+		const newlyDeployedMods: string[] = []
+
+		for (const line of newLines) {
+			const cleanLine = line.trim()
+			const stripped = cleanLine.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, "")
+
+			for (const pattern of errorPatterns) {
+				if (line.match(pattern)) {
+					hasError = true
+					errorMessage = line.replace(/.*(ERROR.*?\t|Error:\s*)/, "").trim()
+					break
+				}
+			}
+
+			if (line.match(/.*WARN.*?\t/)) {
+				const warning = line.replace(/.*WARN.*?\t/, "").trim()
+				if (!existingWarnings.includes(warning) && !newlyDiscoveredWarnings.includes(warning)) {
+					newlyDiscoveredWarnings.push(warning)
+				}
+			}
+
+			const discoveringMatch = stripped.match(/Discovering mod:\s*(.*)/)
+			const analyzingMatch = stripped.match(/Analysing framework mod:\s*(.*)/)
+			const stagingMatch = stripped.match(/Staging RPKG mod:\s*(.*)/)
+			const deployingMatch = stripped.match(/Deploying\s*(.*)/)
+			const writingMatch = stripped.match(/(Writing packagedefinition|Writing chunk|Generating ORES|Rebuilding)/)
+
+			if (discoveringMatch) {
+				currentPhase = "preparing"
+				currentModName = discoveringMatch[1].trim()
+			} else if (analyzingMatch) {
+				currentPhase = "analyzing"
+				const modName = analyzingMatch[1].trim()
+				newlyAnalyzedMods.push(modName)
+				currentModName = modName
+			} else if (stagingMatch) {
+				currentPhase = "deploying"
+				const modName = stagingMatch[1].trim()
+				newlyDeployedMods.push(modName)
+				currentModName = modName
+			} else if (deployingMatch) {
+				currentPhase = "deploying"
+				const modName = deployingMatch[1].trim()
+				newlyDeployedMods.push(modName)
+				currentModName = modName
+			} else if (stripped.includes("Localising text")) {
+				currentPhase = "localising"
+			} else if (stripped.includes("Patching thumbs")) {
+				currentPhase = "patching-thumbs"
+			} else if (stripped.includes("Patching packagedefinition")) {
+				currentPhase = "patching-pd"
+			} else if (stripped.includes("Generating RPKGs")) {
+				currentPhase = "generating-rpkgs"
+			} else if (writingMatch) {
+				currentPhase = "finalizing"
+			}
+		}
+
+		return {
+			hasError,
+			errorMessage,
+			newlyDiscoveredWarnings,
+			newlyAnalyzedMods,
+			newlyDeployedMods,
+			currentPhase,
+			currentModName
+		}
+	}
+
+	function startDeployTimer(deployStartTime: number | null) {
+		if (timerWorker) {
+			timerWorker.terminate()
+		}
+		if (parserWorker) {
+			parserWorker.terminate()
+		}
+		rpkgStartTime = 0
 		clearInterval(deployTimerInterval)
 		clearTimeout(autoScrollTimeout)
-		const startTime = deployStartTime || Date.now()
-		elapsedSeconds = Math.floor((Date.now() - startTime) / 1000)
-		const m = Math.floor(elapsedSeconds / 60)
-		const s = elapsedSeconds % 60
-		elapsedTimeStr = m > 0 ? `${m}m ${s}s` : `${s}s`
+		const offset = deployStartTime ? Date.now() - deployStartTime : 0
+		startPerformanceTime = performance.now() - offset
 
-		deployTimerInterval = setInterval(() => {
-			elapsedSeconds = Math.floor((Date.now() - startTime) / 1000)
+		const workerCode = `
+			let timer = null;
+			self.onmessage = (e) => {
+				if (e.data === "start") {
+					clearInterval(timer);
+					timer = setInterval(() => {
+						self.postMessage("tick");
+					}, 1000);
+				} else if (e.data === "stop") {
+					clearInterval(timer);
+				}
+			};
+		`
+		let timerWorkerUrl = ""
+		try {
+			const blob = new Blob([workerCode], { type: "application/javascript" })
+			timerWorkerUrl = URL.createObjectURL(blob)
+			timerWorker = new Worker(timerWorkerUrl)
+		} catch (err) {
+			console.error("Failed to construct timerWorker:", err)
+			timerWorker = null
+		} finally {
+			if (timerWorkerUrl) URL.revokeObjectURL(timerWorkerUrl)
+		}
+
+		const parserWorkerCode = `
+			let currentPhase = "preparing";
+			let currentModName = "";
+			const parseLogs = ${parseLogs.toString()};
+
+			self.onmessage = (e) => {
+				const { newLines, existingWarnings } = e.data;
+				const result = parseLogs(newLines, existingWarnings, currentPhase, currentModName);
+				currentPhase = result.currentPhase;
+				currentModName = result.currentModName;
+				self.postMessage(result);
+			};
+		`
+		let parserWorkerUrl = ""
+		try {
+			const parserBlob = new Blob([parserWorkerCode], { type: "application/javascript" })
+			parserWorkerUrl = URL.createObjectURL(parserBlob)
+			parserWorker = new Worker(parserWorkerUrl)
+		} catch (err) {
+			console.error("Failed to construct parserWorker:", err)
+			parserWorker = null
+		} finally {
+			if (parserWorkerUrl) URL.revokeObjectURL(parserWorkerUrl)
+		}
+
+		const updateTimer = () => {
+			const elapsedMs = performance.now() - startPerformanceTime
+			elapsedSeconds = Math.max(0, Math.floor(elapsedMs / 1000))
 			const m = Math.floor(elapsedSeconds / 60)
 			const s = elapsedSeconds % 60
 			elapsedTimeStr = m > 0 ? `${m}m ${s}s` : `${s}s`
-		}, 1000)
+		}
+
+		updateTimer()
+
+		if (timerWorker) {
+			timerWorker.onmessage = (e) => {
+				if (e.data === "tick") {
+					updateTimer()
+					updateProgressAndLabels()
+				}
+			}
+			timerWorker.onerror = (error) => {
+				console.error("timerWorker runtime error:", error)
+				if (timerWorker) {
+					timerWorker.terminate()
+					timerWorker = null
+				}
+				clearInterval(deployTimerInterval)
+				deployTimerInterval = setInterval(() => {
+					updateTimer()
+					updateProgressAndLabels()
+				}, 1000)
+			}
+			timerWorker.postMessage("start")
+		} else {
+			clearInterval(deployTimerInterval)
+			deployTimerInterval = setInterval(() => {
+				updateTimer()
+				updateProgressAndLabels()
+			}, 1000)
+		}
+
+		if (parserWorker) {
+			parserWorker.onmessage = (e) => {
+				const {
+					hasError: workerHasError,
+					errorMessage: workerErrorMessage,
+					newlyDiscoveredWarnings,
+					newlyAnalyzedMods,
+					newlyDeployedMods,
+					currentPhase: workerCurrentPhase,
+					currentModName: workerCurrentModName
+				} = e.data
+
+				if (workerHasError) {
+					hasError = true
+					errorMessage = workerErrorMessage
+				}
+
+				if (newlyDiscoveredWarnings.length > 0) {
+					deployWarnings = [...deployWarnings, ...newlyDiscoveredWarnings]
+				}
+
+				if (newlyAnalyzedMods.length > 0) {
+					for (const mod of newlyAnalyzedMods) {
+						analyzedMods.add(mod)
+					}
+					analyzedMods = analyzedMods
+				}
+
+				if (newlyDeployedMods.length > 0) {
+					for (const mod of newlyDeployedMods) {
+						deployedMods.add(mod)
+					}
+					deployedMods = deployedMods
+				}
+
+				if (workerCurrentPhase === "generating-rpkgs" && currentPhase !== "generating-rpkgs") {
+					rpkgStartTime = performance.now()
+				}
+
+				currentPhase = workerCurrentPhase
+				currentModName = workerCurrentModName
+
+				updateProgressAndLabels()
+			}
+			parserWorker.onerror = (error) => {
+				console.error("parserWorker runtime error:", error)
+				if (parserWorker) {
+					parserWorker.terminate()
+					parserWorker = null
+				}
+				convertOutputToHTML()
+			}
+		}
 	}
 
 	function stopDeployTimer() {
 		clearInterval(deployTimerInterval)
 		clearTimeout(autoScrollTimeout)
+		if (timerWorker) {
+			timerWorker.terminate()
+			timerWorker = null
+		}
+		if (parserWorker) {
+			parserWorker.terminate()
+			parserWorker = null
+		}
+	}
+
+	function updateProgressAndLabels() {
+		totalMods = enabledMods.length
+		stagedCount = deployedMods.size
+
+		if (hasError) {
+			// Stay in error state
+		} else if (deployFinished) {
+			progressPercent = 100
+			statusLabel = "Deployment completed successfully!"
+		} else if (totalMods > 0) {
+			if (currentPhase === "preparing") {
+				progressPercent = Math.min(10, Math.round((totalLinesCount / 50) * 10))
+				statusLabel = `Preparing deployment... (${currentModName})`
+			} else if (currentPhase === "analyzing") {
+				const fraction = totalMods > 0 ? analyzedMods.size / totalMods : 0
+				progressPercent = Math.round(11 + fraction * 19)
+				statusLabel = `Analyzing mod: ${currentModName} (${analyzedMods.size}/${totalMods})`
+			} else if (currentPhase === "deploying") {
+				const fraction = totalMods > 0 ? deployedMods.size / totalMods : 0
+				progressPercent = Math.round(31 + fraction * 49)
+				statusLabel = `Deploying mod: ${currentModName} (${deployedMods.size}/${totalMods})`
+			} else if (currentPhase === "localising") {
+				progressPercent = 82
+				statusLabel = "Localising text..."
+			} else if (currentPhase === "patching-thumbs") {
+				progressPercent = 85
+				statusLabel = "Patching thumbs..."
+			} else if (currentPhase === "patching-pd") {
+				progressPercent = 88
+				statusLabel = "Patching packagedefinition..."
+			} else if (currentPhase === "generating-rpkgs") {
+				statusLabel = "Generating RPKGs..."
+				if (rpkgStartTime > 0) {
+					const elapsedMs = performance.now() - rpkgStartTime
+					let durationSec = 90
+					if (totalMods <= 1) {
+						durationSec = 90
+					} else if (totalMods <= 5) {
+						durationSec = 90 + ((totalMods - 1) / 4) * 210
+					} else if (totalMods <= 10) {
+						durationSec = 300 + ((totalMods - 5) / 5) * 300
+					} else if (totalMods <= 20) {
+						durationSec = 600 + ((totalMods - 10) / 10) * 300
+					} else {
+						durationSec = 900 + (totalMods - 20) * 60
+					}
+					const ratio = Math.min(1, elapsedMs / (durationSec * 1000))
+					progressPercent = Math.round(90 + ratio * 8)
+				} else {
+					progressPercent = 90
+				}
+			} else if (currentPhase === "finalizing") {
+				progressPercent = 95
+				statusLabel = "Finalizing deployment..."
+			}
+		} else {
+			progressPercent = 0
+			statusLabel = "Preparing deployment..."
+		}
 	}
 
 	function handleKeydown(event: KeyboardEvent) {
@@ -240,12 +557,12 @@
 		const el = e.currentTarget
 		if (!el) return
 
-		const isAtBottom = el.scrollHeight - el.clientHeight - el.scrollTop < 50
+		const isAtBottom = el.scrollHeight - el.clientHeight - el.scrollTop < 100
 		wasAtBottom = isAtBottom
 
 		clearTimeout(autoScrollTimeout)
 		if (!isAtBottom) {
-			const delay = Math.floor(Math.random() * 10000) + 15000
+			const delay = 20000
 			autoScrollTimeout = setTimeout(() => {
 				wasAtBottom = true
 				const targetEl = document.getElementById("deployOutputElement")
@@ -259,7 +576,7 @@
 	const convertOutputToHTML = throttle(() => {
 		const el = document.getElementById("deployOutputElement")
 		if (el) {
-			wasAtBottom = el.scrollHeight - el.clientHeight - el.scrollTop < 50
+			wasAtBottom = el.scrollHeight - el.clientHeight - el.scrollTop < 100
 		} else {
 			wasAtBottom = true
 		}
@@ -272,6 +589,8 @@
 
 		const isFinal = deployFinished || hasError
 		const newChunk = deployOutput.substring(lastParsedLength)
+		let newLines: string[] = []
+
 		if (newChunk) {
 			let completeChunk = ""
 			let consumedLength = 0
@@ -295,7 +614,6 @@
 					rawLinesChunk.pop()
 				}
 
-				const newLines: string[] = []
 				for (const line of rawLinesChunk) {
 					if (line !== lastAppendedLine) {
 						newLines.push(line)
@@ -311,111 +629,23 @@
 			}
 		}
 
-		// Parse lines for warnings and errors and deduplicate consecutive identical lines
-		const rawLines = deployOutput.split(/\r?\n/)
-		const lines: string[] = []
-		for (let i = 0; i < rawLines.length; i++) {
-			if (i === 0 || rawLines[i] !== rawLines[i - 1]) {
-				lines.push(rawLines[i])
+		if (newLines.length > 0) {
+			totalLinesCount += newLines.length
+			if (deployFinished || hasError || !parserWorker) {
+				parseLinesSynchronously(newLines)
+			} else {
+				parserWorker.postMessage({ newLines, existingWarnings: deployWarnings })
 			}
 		}
 
-		// 1. Error detection
-		const errorPatterns = [/.*ERROR.*?\t/, /Error:\s*(.*)/, /uncaughtException/, /unhandledRejection/]
+		updateProgressAndLabels()
 
-		let errorLine = ""
-		for (const pattern of errorPatterns) {
-			const found = lines.find((a) => a.match(pattern))
-			if (found) {
-				errorLine = found
-				break
-			}
-		}
-
-		if (errorLine) {
-			hasError = true
-			errorMessage = errorLine.replace(/.*(ERROR.*?\t|Error:\s*)/, "").trim()
-			stopDeployTimer()
-		}
-
-		// 2. Warnings parsing (unique list, no duplicates)
-		const warningsList = lines.filter((a) => a.match(/.*WARN.*?\t/)).map((a) => a.replace(/.*WARN.*?\t/, "").trim())
-		deployWarnings = [...new Set(warningsList)]
-
-		// 3. Progress tracking
-		let analyzedMods = new Set()
-		let deployedMods = new Set()
-		let currentModName = ""
-		let currentPhase = "preparing" // preparing, analyzing, deploying, finalizing
-
-		for (const line of lines) {
-			const cleanLine = line.trim()
-			const stripped = cleanLine.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, "")
-
-			const discoveringMatch = stripped.match(/Discovering mod:\s*(.*)/)
-			const analyzingMatch = stripped.match(/Analysing framework mod:\s*(.*)/)
-			const stagingMatch = stripped.match(/Staging RPKG mod:\s*(.*)/)
-			const deployingMatch = stripped.match(/Deploying\s*(.*)/)
-			const writingMatch = stripped.match(/(Writing packagedefinition|Writing chunk|Generating ORES|Rebuilding)/)
-
-			if (discoveringMatch) {
-				currentPhase = "preparing"
-				currentModName = discoveringMatch[1].trim()
-			} else if (analyzingMatch) {
-				currentPhase = "analyzing"
-				const modName = analyzingMatch[1].trim()
-				analyzedMods.add(modName)
-				currentModName = modName
-			} else if (stagingMatch) {
-				currentPhase = "deploying"
-				const modName = stagingMatch[1].trim()
-				deployedMods.add(modName)
-				currentModName = modName
-			} else if (deployingMatch) {
-				currentPhase = "deploying"
-				const modName = deployingMatch[1].trim()
-				deployedMods.add(modName)
-				currentModName = modName
-			} else if (writingMatch) {
-				currentPhase = "finalizing"
-			}
-		}
-
-		totalMods = enabledMods.length
-		stagedCount = deployedMods.size
-
-		if (hasError) {
-			// Stay in error state
-		} else if (deployFinished) {
-			progressPercent = 100
-			statusLabel = "Deployment completed successfully!"
-		} else if (totalMods > 0) {
-			if (currentPhase === "preparing") {
-				progressPercent = Math.min(10, Math.round((lines.length / 50) * 10))
-				statusLabel = `Preparing deployment... (${currentModName})`
-			} else if (currentPhase === "analyzing") {
-				const fraction = totalMods > 0 ? analyzedMods.size / totalMods : 0
-				progressPercent = Math.round(10 + fraction * 30)
-				statusLabel = `Analyzing mod: ${currentModName} (${analyzedMods.size}/${totalMods})`
-			} else if (currentPhase === "deploying") {
-				const fraction = totalMods > 0 ? deployedMods.size / totalMods : 0
-				progressPercent = Math.round(40 + fraction * 50)
-				statusLabel = `Deploying mod: ${currentModName} (${deployedMods.size}/${totalMods})`
-			} else if (currentPhase === "finalizing") {
-				progressPercent = 95
-				statusLabel = "Finalizing deployment..."
-			}
-		} else {
-			progressPercent = 0
-			statusLabel = "Preparing deployment..."
-		}
-
-		setTimeout(() => {
+		tick().then(() => {
 			const el = document.getElementById("deployOutputElement")
 			if (el && wasAtBottom) {
 				el.scrollTop = el.scrollHeight
 			}
-		}, 50)
+		})
 	}, 200)
 
 	window.ipc.receive("frameworkDeployOutput", (output: string) => {
@@ -425,9 +655,8 @@
 
 	window.ipc.receive("frameworkDeployFinished", () => {
 		deployFinished = true
-		stopDeployTimer()
-		convertOutputToHTML()
 		convertOutputToHTML.flush()
+		stopDeployTimer()
 
 		const lines = deployOutput.split(/\r?\n/).map((a) => a.trim())
 		const succeeded = lines.some((a) => a.includes("Done in"))
@@ -437,7 +666,11 @@
 			statusLabel = "Deployment completed successfully!"
 		} else {
 			hasError = true
-			statusLabel = "Deployment failed"
+			if (deployOutput.includes("Deploy.exe exited with code") || deployOutput.includes("Failed to start Deploy.exe")) {
+				statusLabel = "Deployment failed: deploy.exe crashed"
+			} else {
+				statusLabel = "Deployment failed"
+			}
 
 			// Kill deploy process tree to prevent process leak
 			window.ipc.send("killDeployProcess")
@@ -620,7 +853,7 @@
 									continue
 								}
 
-								const modValidation = validateModFolder(modFolder)
+								const modValidation = await validateModFolder(modFolder)
 								if (!modValidation[0]) {
 									status = "invalid"
 									errors.push(`Validation failed for "${manifest.name || a}": ${modValidation[1]}`)
@@ -720,7 +953,7 @@
 	/**
 	 * Replaces a destination folder with a temporary source folder safely.
 	 * Backs up the destination first and rolls back if the replacement fails.
-	 * 
+	 *
 	 * @param tempSource The path to the temporary source directory.
 	 * @param destFolder The path to the destination directory.
 	 */
@@ -994,14 +1227,58 @@
 		forceModListsUpdate = Math.random()
 		markChanged()
 	}
+
+	function parseLinesSynchronously(newLines: string[]) {
+		const result = parseLogs(newLines, deployWarnings, currentPhase, currentModName)
+
+		if (result.hasError) {
+			hasError = true
+			errorMessage = result.errorMessage
+		}
+
+		if (result.newlyDiscoveredWarnings.length > 0) {
+			deployWarnings = [...deployWarnings, ...result.newlyDiscoveredWarnings]
+		}
+
+		if (result.newlyAnalyzedMods.length > 0) {
+			for (const mod of result.newlyAnalyzedMods) {
+				analyzedMods.add(mod)
+			}
+			analyzedMods = analyzedMods
+		}
+
+		if (result.newlyDeployedMods.length > 0) {
+			for (const mod of result.newlyDeployedMods) {
+				deployedMods.add(mod)
+			}
+			deployedMods = deployedMods
+		}
+
+		if (result.currentPhase === "generating-rpkgs" && currentPhase !== "generating-rpkgs") {
+			rpkgStartTime = performance.now()
+		}
+
+		currentPhase = result.currentPhase
+		currentModName = result.currentModName
+
+		updateProgressAndLabels()
+	}
+
+	onDestroy(() => {
+		stopDeployTimer()
+	})
+
+	beforeNavigate((navigation) => {
+		if (frameworkDeployModalOpen && !deployFinished) {
+			navigation.cancel()
+		}
+	})
 </script>
 
 <svelte:window on:keydown={handleKeydown} />
 
 {#if !cacheLoaded}
-	<div class="flex flex-col items-center justify-center h-full w-full gap-4">
-		<InlineLoading description="Loading mods cache..." />
-	</div>
+	<CacheLoading loading={!cacheLoaded} error={cacheLoadError} retryCallback={preloadCache} />
 {:else}
 	<div class="grid grid-cols-2 gap-4 w-full mb-16">
 		<div class="w-full">
@@ -1153,7 +1430,10 @@
 			try {
 				const modFolder = getModFolder(deleteModInProgress)
 				await removeDirectoryRecursive(modFolder)
-				mergeConfig({ knownMods: getConfig().knownMods.filter((a) => a != deleteModInProgress) })
+				mergeConfig({
+					knownMods: getConfig().knownMods.filter((a) => a != deleteModInProgress),
+					loadOrder: getConfig().loadOrder.filter((a) => a != deleteModInProgress)
+				})
 				clearValidationCacheForFolder(modFolder)
 
 				deleteModModalOpen = false
@@ -1189,7 +1469,18 @@
 		<p>The framework couldn't sort your mods! Ask the developer of whichever mod you most recently installed to investigate this. Also, report this to Atampy26 on Hitman Forum or Discord.</p>
 	</Modal>
 
-	<Modal passiveModal open={frameworkDeployModalOpen} modalHeading="Applying your mods" preventCloseOnClickOutside>
+	<Modal
+		passiveModal
+		bind:open={frameworkDeployModalOpen}
+		modalHeading="Applying your mods"
+		preventCloseOnClickOutside={!deployFinished}
+		on:close={(e) => {
+			if (!deployFinished) {
+				e.preventDefault()
+				frameworkDeployModalOpen = true
+			}
+		}}
+	>
 		{#if hasError}
 			<div class="mb-4">
 				<InlineNotification hideCloseButton lowContrast kind="error" title="Deployment Failed" subtitle={errorMessage} style="max-width: none; width: 100%;" />
@@ -1226,16 +1517,14 @@
 			<pre
 				use:setupConsoleResizeObserver
 				class="flex-1 min-h-[25vh] min-w-[17.5rem] overflow-auto whitespace-pre-wrap bg-neutral-800 p-2 border border-neutral-700/30 rounded-sm"
-				style="font-family: 'Fira Code', 'IBM Plex Mono', 'Menlo', 'DejaVu Sans Mono', 'Bitstream Vera Sans Mono', Courier, monospace; color-scheme: dark; font-size: 0.75rem; resize: vertical; height: {consoleHeight ||
-					'35vh'}; max-height: 535px;"
+				style="font-family: 'Fira Code', 'IBM Plex Mono', 'Menlo', 'DejaVu Sans Mono', 'Bitstream Vera Sans Mono', Courier, monospace; color-scheme: dark; font-size: 0.75rem; resize: vertical; height: 35vh; max-height: 60vh;"
 				id="deployOutputElement"
 				on:scroll={handleScroll}>{@html deployOutputHTML}</pre>
 
 			{#if deployWarnings.length > 0}
 				<div
 					class="overflow-y-auto bg-neutral-800 p-2 border border-yellow-600/40 rounded-sm text-yellow-300 text-xs flex flex-col gap-1"
-					style="width: 260px; font-family: 'Fira Code', 'IBM Plex Mono', monospace; color-scheme: dark; height: {consoleHeight ||
-						'35vh'}; min-height: 25vh; max-height: 535px; margin-left: auto;"
+					style="width: 260px; font-family: 'Fira Code', 'IBM Plex Mono', monospace; color-scheme: dark; min-height: 25vh; max-height: 60vh; margin-left: auto;"
 				>
 					<div class="font-bold border-b border-yellow-600/30 pb-1 mb-1 sticky top-0 bg-neutral-800 z-10">Warnings ({deployWarnings.length})</div>
 					{#each deployWarnings as warning, index}
@@ -1450,7 +1739,6 @@
 	>
 		<p>The mod {autoInstallModName} has been downloaded via a link - would you like to install it?</p>
 	</Modal>
-
 {/if}
 
 <style>

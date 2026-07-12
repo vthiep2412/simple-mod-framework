@@ -3,8 +3,9 @@
 	import { onMount } from "svelte"
 
 	import ExpandableTile from "$lib/ExpandableTile.svelte"
+	import CacheLoading from "$lib/CacheLoading.svelte"
 	import { getConfig, getManifestFromModID, getModFolder, mergeConfig, modIsFramework, preloadModsCache } from "$lib/utils"
-	import { Checkbox, RadioButtonGroup, RadioButton, Truncate, InlineLoading } from "carbon-components-svelte"
+	import { Checkbox, RadioButtonGroup, RadioButton, Truncate } from "carbon-components-svelte"
 	import { scale } from "svelte/transition"
 	import { OptionType, type Manifest } from "../../../../src/types"
 
@@ -27,39 +28,53 @@
 	let selectedMod: string | null = null
 	let groupOptions: Record<string, Record<string, any[]>> = {}
 	let cacheLoaded = false
+	let cacheLoadError = ""
 
 	if ($page.url.searchParams.get("mod")) selectedMod = $page.url.searchParams.get("mod")
 
-	onMount(async () => {
-		await preloadModsCache("settings")
+	async function preloadCache() {
+		cacheLoaded = false
+		cacheLoadError = ""
+		try {
+			await preloadModsCache("settings")
 
-		config = getConfig()
-		mods = config.loadOrder
-			.filter((a: string) => modIsFramework(a) && config.modOptions[a])
-			.map((a: string) => getManifestFromModID(a))
-			.filter((a: any) => a && a.options && a.options.filter((x: any) => x.type != OptionType.conditional).length)
+			config = getConfig()
+			mods = config.loadOrder
+				.filter((a: string) => modIsFramework(a) && config.modOptions[a])
+				.map((a: string) => getManifestFromModID(a))
+				.filter((a: any) => a && a.options && a.options.filter((x: any) => x.type != OptionType.conditional).length)
 
-		let column = 0
-		for (const mod of mods) {
-			columns[column as 0 | 1 | 2].push(mod)
+			let column = 0
+			columns[0].length = 0
+			columns[1].length = 0
+			columns[2].length = 0
+			for (const mod of mods) {
+				columns[column as 0 | 1 | 2].push(mod)
 
-			column++
-			if (column > 2) column = 0
-		}
+				column++
+				if (column > 2) column = 0
+			}
 
-		mods.forEach((mod) => {
-			groupOptions[mod.id] = {}
+			mods.forEach((mod) => {
+				groupOptions[mod.id] = {}
 
-			mod.options?.forEach((opt: any) => {
-				const option = opt as any
-				if (option.type == "select") {
-					groupOptions[mod.id][option.group] ??= []
-					groupOptions[mod.id][option.group]?.push(option)
-				}
+				mod.options?.forEach((opt: any) => {
+					const option = opt as any
+					if (option.type == "select") {
+						groupOptions[mod.id][option.group] ??= []
+						groupOptions[mod.id][option.group]?.push(option)
+					}
+				})
 			})
-		})
+			cacheLoaded = true
+		} catch (err: any) {
+			console.error("Failed to load settings:", err)
+			cacheLoadError = err?.message || "Failed to load mod settings."
+		}
+	}
 
-		cacheLoaded = true
+	onMount(() => {
+		preloadCache()
 	})
 
 	function getCheckboxOptions(options: any[] | undefined) {
@@ -129,9 +144,7 @@
 </script>
 
 {#if !cacheLoaded}
-	<div class="flex items-center justify-center h-[80vh]">
-		<InlineLoading description="Loading mod settings..." />
-	</div>
+	<CacheLoading loading={!cacheLoaded} error={cacheLoadError} retryCallback={preloadCache} loadingText="Loading mod settings..." buildingText="Still building cache 💅" />
 {:else}
 	<h1 class="text-center" transition:scale>Mod Settings</h1>
 	<br />

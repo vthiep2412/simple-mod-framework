@@ -4,8 +4,12 @@ const { app, BrowserWindow, ipcMain, dialog } = require("electron")
 const serve = require("electron-serve")
 // skipcq: JS-0359
 const { spawn, execSync } = require("child_process")
+// skipcq: JS-0359
 const fs = require("fs")
+// skipcq: JS-0359
 const path = require("path")
+// skipcq: JS-0359
+const json5 = require("json5")
 
 try {
 	require("electron-reloader")(module, {
@@ -23,6 +27,11 @@ const port = process.env.PORT || 3000
 const dev = !app.isPackaged
 /** @type BrowserWindow */
 let mainWindow
+const sendToWindow = (channel, ...args) => {
+	if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents && !mainWindow.webContents.isDestroyed()) {
+		mainWindow.webContents.send(channel, ...args)
+	}
+}
 let isDeploying = false
 let deployOutput = ""
 let deployProcess = null
@@ -68,7 +77,7 @@ function createWindow() {
 
 	if (process.argv[process.argv.length - 1] && process.argv[process.argv.length - 1].startsWith("simple-mod-framework://")) {
 		mainWindow.webContents.once("did-finish-load", () => {
-			mainWindow.webContents.send("urlScheme", process.argv.pop().replace("simple-mod-framework://", ""))
+			sendToWindow("urlScheme", process.argv.pop().replace("simple-mod-framework://", ""))
 		})
 	}
 
@@ -128,7 +137,7 @@ if (!lock) {
 		}
 
 		if (commandLine[commandLine.length - 1] && commandLine[commandLine.length - 1].startsWith("simple-mod-framework://")) {
-			mainWindow.webContents.send("urlScheme", commandLine.pop().replace("simple-mod-framework://", ""))
+			sendToWindow("urlScheme", commandLine.pop().replace("simple-mod-framework://", ""))
 		}
 	})
 
@@ -149,10 +158,141 @@ if (!lock) {
 	})
 }
 
+const fsPromises = fs.promises
+
+// skipcq: JS-0067, JS-R1005
+async function getJsonFilesAsync(dir, visited = new Set()) {
+	const results = []
+	try {
+		const realDir = await fsPromises.realpath(dir)
+		if (visited.has(realDir)) return results
+		visited.add(realDir)
+
+		const list = await fsPromises.readdir(realDir, { withFileTypes: true })
+		for (const file of list) {
+			const res = path.resolve(realDir, file.name)
+			if (file.isDirectory()) {
+				results.push(...(await getJsonFilesAsync(res, visited)))
+			} else if (
+				file.name.endsWith("entity.json") ||
+				file.name.endsWith("entity.patch.json") ||
+				file.name.endsWith("repository.json") ||
+				file.name.endsWith("unlockables.json") ||
+				file.name.endsWith("JSON.patch.json") ||
+				file.name.endsWith("contract.json")
+			) {
+				results.push(res)
+			}
+		}
+	} catch {}
+	return results
+}
+
+// skipcq: JS-R1005
+ipcMain.handle("get-mod-stats", async (event, modFolder) => {
+	try {
+		const manifestPath = path.join(modFolder, "manifest.json")
+		try {
+			await fsPromises.access(manifestPath)
+		} catch {
+			return {
+				statsParts: [`${manifestPath}:missing`],
+				manifest: null,
+				contentFoldersStatus: {},
+				jsonFilesData: {}
+			}
+		}
+
+		const filesToStat = [manifestPath]
+		let manifest = null
+		const contentFoldersStatus = {}
+
+		try {
+			const manifestContent = await fsPromises.readFile(manifestPath, "utf8")
+			manifest = json5.parse(manifestContent)
+
+			const contentDirs = [
+				...(manifest.contentFolders || []),
+				...(manifest.options || []).flatMap((opt) => opt.contentFolders || [])
+			]
+			for (const dir of contentDirs) {
+				if (!dir) continue
+				const fullPath = path.resolve(modFolder, dir)
+				const relative = path.relative(modFolder, fullPath)
+				if (relative.startsWith("..") || path.isAbsolute(relative)) {
+					continue
+				}
+				try {
+					await fsPromises.access(fullPath)
+					contentFoldersStatus[dir] = true
+					filesToStat.push(fullPath)
+				} catch {
+					contentFoldersStatus[dir] = false
+				}
+			}
+
+			const blobsDirs = [
+				...(manifest.blobsFolders || []),
+				...(manifest.options || []).flatMap((opt) => opt.blobsFolders || [])
+			]
+			for (const dir of blobsDirs) {
+				if (!dir) continue
+				const fullPath = path.resolve(modFolder, dir)
+				const relative = path.relative(modFolder, fullPath)
+				if (relative.startsWith("..") || path.isAbsolute(relative)) {
+					continue
+				}
+				try {
+					await fsPromises.access(fullPath)
+					filesToStat.push(fullPath)
+				} catch {}
+			}
+		} catch {}
+
+		const jsonFilesData = {}
+		try {
+			const klawFiles = await getJsonFilesAsync(modFolder)
+			filesToStat.push(...klawFiles)
+
+			for (const file of klawFiles) {
+				try {
+					const content = await fsPromises.readFile(file, "utf8")
+					jsonFilesData[file] = content
+				} catch {}
+			}
+		} catch {}
+
+		const statsParts = await Promise.all(
+			filesToStat.map(async (file) => {
+				try {
+					const stat = await fsPromises.stat(file)
+					return `${file}:${stat.mtimeMs}:${stat.size}`
+				} catch {
+					return `${file}:missing`
+				}
+			})
+		)
+
+		return {
+			statsParts,
+			manifest,
+			contentFoldersStatus,
+			jsonFilesData
+		}
+	} catch {
+		return {
+			statsParts: [],
+			manifest: null,
+			contentFoldersStatus: {},
+			jsonFilesData: {}
+		}
+	}
+})
+
 ipcMain.on("deploy", () => {
 	if (isDeploying) {
-		mainWindow.webContents.send("frameworkDeployModalOpen", deployStartTime)
-		mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
+		sendToWindow("frameworkDeployModalOpen", deployStartTime)
+		sendToWindow("frameworkDeployOutput", deployOutput)
 		return
 	}
 	isDeploying = true
@@ -184,31 +324,38 @@ ipcMain.on("deploy", () => {
 				const errMsg = err?.message || String(err)
 				deployOutput = isSpawnError ? `Failed to start Deploy.exe: ${errMsg}` : `Deployment failed: ${errMsg}`
 			}
-			mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
+			sendToWindow("frameworkDeployOutput", deployOutput)
 		}
-		mainWindow.webContents.send("frameworkDeployFinished")
+		sendToWindow("frameworkDeployFinished")
 	}
 
 	try {
-		deployProcess = spawn("Deploy.exe --doNotPause --colors", [], {
-			shell: true,
-			cwd: ".."
-		})
+		const simPath = path.join(__dirname, "..", "simulate-deploy.cjs")
+		if (dev && fs.existsSync(simPath)) {
+			deployProcess = spawn("node", [simPath], {
+				cwd: path.join(__dirname, "..")
+			})
+		} else {
+			deployProcess = spawn("Deploy.exe --doNotPause --colors", [], {
+				shell: true,
+				cwd: ".."
+			})
+		}
 
 		deployProcess.on("error", (err) => {
 			cleanupDeploy(err)
 		})
 
-		mainWindow.webContents.send("frameworkDeployModalOpen", deployStartTime)
+		sendToWindow("frameworkDeployModalOpen", deployStartTime)
 
 		deployProcess.stdout.on("data", (data) => {
 			deployOutput += String(data)
-			mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
+			sendToWindow("frameworkDeployOutput", deployOutput)
 		})
 
 		deployProcess.stderr.on("data", (data) => {
 			deployOutput += String(data)
-			mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
+			sendToWindow("frameworkDeployOutput", deployOutput)
 		})
 
 		deployProcess.on("close", (code, signal) => {
@@ -225,8 +372,8 @@ ipcMain.on("deploy", () => {
 
 ipcMain.on("checkDeployStatus", () => {
 	if (isDeploying) {
-		mainWindow.webContents.send("frameworkDeployModalOpen", deployStartTime)
-		mainWindow.webContents.send("frameworkDeployOutput", deployOutput)
+		sendToWindow("frameworkDeployModalOpen", deployStartTime)
+		sendToWindow("frameworkDeployOutput", deployOutput)
 	}
 })
 
@@ -243,7 +390,7 @@ ipcMain.on("killDeployProcess", () => {
 })
 
 ipcMain.on("modFileOpenDialog", () => {
-	mainWindow.webContents.send(
+	sendToWindow(
 		"modFileOpenDialogResult",
 		dialog.showOpenDialogSync(mainWindow, {
 			title: "Add a mod file",
@@ -255,7 +402,7 @@ ipcMain.on("modFileOpenDialog", () => {
 })
 
 ipcMain.on("runtimePackageOpenDialog", () => {
-	mainWindow.webContents.send(
+	sendToWindow(
 		"runtimePackageOpenDialogResult",
 		dialog.showOpenDialogSync(mainWindow, {
 			title: "Select an RPKG file",
@@ -267,7 +414,7 @@ ipcMain.on("runtimePackageOpenDialog", () => {
 })
 
 ipcMain.on("imageOpenDialog", () => {
-	mainWindow.webContents.send(
+	sendToWindow(
 		"imageOpenDialogResult",
 		dialog.showOpenDialogSync(mainWindow, {
 			title: "Select an image",

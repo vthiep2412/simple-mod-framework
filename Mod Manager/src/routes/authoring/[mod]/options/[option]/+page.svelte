@@ -16,7 +16,7 @@
 
 	import { Language, OptionType, Platform, type Manifest } from "../../../../../../../src/types"
 
-	import { Button, Checkbox, RadioButton, RadioButtonGroup, InlineLoading } from "carbon-components-svelte"
+	import { Button, Checkbox, RadioButton, RadioButtonGroup, Loading } from "carbon-components-svelte"
 	import Edit from "carbon-icons-svelte/lib/Edit.svelte"
 	import CloseOutline from "carbon-icons-svelte/lib/CloseOutline.svelte"
 
@@ -36,13 +36,18 @@
 	} as Manifest
 
 	let cacheLoaded = false
+	let showBuildingCache = false
 
 	onMount(async () => {
+		const timer = setTimeout(() => {
+			showBuildingCache = true
+		}, 1500)
 		try {
 			await preloadModsCache("authoring-option")
 		} catch (err) {
 			console.error("Failed to preload mods cache for authoring-option:", err)
 		} finally {
+			clearTimeout(timer)
 			cacheLoaded = true
 			dummyForceUpdate = Math.random()
 		}
@@ -131,8 +136,11 @@
 </script>
 
 {#if !cacheLoaded}
-	<div class="flex flex-col items-center justify-center h-full w-full gap-4 mt-8">
-		<InlineLoading description="Loading mod settings..." />
+	<div class="flex flex-col items-center justify-center h-[80vh] w-full gap-4 mt-8">
+		<Loading withOverlay={false} />
+		<span class="text-gray-400 text-sm">
+			{showBuildingCache ? "Still building cache 💅" : "Loading mod settings..."}
+		</span>
 	</div>
 {:else}
 <div class="flex gap-8 items-center">

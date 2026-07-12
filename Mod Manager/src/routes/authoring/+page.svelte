@@ -2,21 +2,29 @@
 	import { scale } from "svelte/transition"
 	import { onMount } from "svelte"
 
-	import { Button, Tile, Truncate, InlineLoading } from "carbon-components-svelte"
+	import { Button, Tile, Truncate } from "carbon-components-svelte"
+	import CacheLoading from "$lib/CacheLoading.svelte"
 	import { getAllMods, getManifestFromModID, modIsFramework, preloadModsCache } from "$lib/utils"
 	import Edit from "carbon-icons-svelte/lib/Edit.svelte"
 	import { goto } from "$app/navigation"
 
 	let cacheLoaded = false
+	let cacheLoadError = ""
 
-	onMount(async () => {
+	async function preloadCache() {
+		cacheLoaded = false
+		cacheLoadError = ""
 		try {
 			await preloadModsCache("authoring")
-		} catch (err) {
-			console.error("Failed to load mods cache for authoring:", err)
-		} finally {
 			cacheLoaded = true
+		} catch (err: any) {
+			console.error("Failed to load mods cache for authoring:", err)
+			cacheLoadError = err?.message || "Failed to load mods cache."
 		}
+	}
+
+	onMount(() => {
+		preloadCache()
 	})
 </script>
 
@@ -31,9 +39,7 @@
 <br />
 
 {#if !cacheLoaded}
-	<div class="flex flex-col items-center justify-center h-full w-full gap-4 mt-8">
-		<InlineLoading description="Loading mods cache..." />
-	</div>
+	<CacheLoading loading={!cacheLoaded} error={cacheLoadError} retryCallback={preloadCache} mt8={true} />
 {:else}
 	<div class="mt-4 {window.screen.height <= 1080 ? 'h-[82vh]' : 'h-[85vh]'} pr-4 overflow-y-auto">
 		<div class="flex flex-wrap gap-4">
