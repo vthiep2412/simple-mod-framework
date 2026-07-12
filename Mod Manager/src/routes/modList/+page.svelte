@@ -222,6 +222,83 @@
 	let parserWorker: Worker | null = null
 	let rpkgStartTime = 0
 
+	function parseLogs(newLines: string[], existingWarnings: string[], initialPhase: string, initialModName: string) {
+		const errorPatterns = [/.*ERROR.*?\t/, /Error:\s*(.*)/, /uncaughtException/, /unhandledRejection/]
+		let currentPhase = initialPhase
+		let currentModName = initialModName
+		let hasError = false
+		let errorMessage = ""
+		const newlyDiscoveredWarnings: string[] = []
+		const newlyAnalyzedMods: string[] = []
+		const newlyDeployedMods: string[] = []
+
+		for (const line of newLines) {
+			const cleanLine = line.trim()
+			const stripped = cleanLine.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, "")
+
+			for (const pattern of errorPatterns) {
+				if (line.match(pattern)) {
+					hasError = true
+					errorMessage = line.replace(/.*(ERROR.*?\t|Error:\s*)/, "").trim()
+					break
+				}
+			}
+
+			if (line.match(/.*WARN.*?\t/)) {
+				const warning = line.replace(/.*WARN.*?\t/, "").trim()
+				if (!existingWarnings.includes(warning) && !newlyDiscoveredWarnings.includes(warning)) {
+					newlyDiscoveredWarnings.push(warning)
+				}
+			}
+
+			const discoveringMatch = stripped.match(/Discovering mod:\s*(.*)/)
+			const analyzingMatch = stripped.match(/Analysing framework mod:\s*(.*)/)
+			const stagingMatch = stripped.match(/Staging RPKG mod:\s*(.*)/)
+			const deployingMatch = stripped.match(/Deploying\s*(.*)/)
+			const writingMatch = stripped.match(/(Writing packagedefinition|Writing chunk|Generating ORES|Rebuilding)/)
+
+			if (discoveringMatch) {
+				currentPhase = "preparing"
+				currentModName = discoveringMatch[1].trim()
+			} else if (analyzingMatch) {
+				currentPhase = "analyzing"
+				const modName = analyzingMatch[1].trim()
+				newlyAnalyzedMods.push(modName)
+				currentModName = modName
+			} else if (stagingMatch) {
+				currentPhase = "deploying"
+				const modName = stagingMatch[1].trim()
+				newlyDeployedMods.push(modName)
+				currentModName = modName
+			} else if (deployingMatch) {
+				currentPhase = "deploying"
+				const modName = deployingMatch[1].trim()
+				newlyDeployedMods.push(modName)
+				currentModName = modName
+			} else if (stripped.includes("Localising text")) {
+				currentPhase = "localising"
+			} else if (stripped.includes("Patching thumbs")) {
+				currentPhase = "patching-thumbs"
+			} else if (stripped.includes("Patching packagedefinition")) {
+				currentPhase = "patching-pd"
+			} else if (stripped.includes("Generating RPKGs")) {
+				currentPhase = "generating-rpkgs"
+			} else if (writingMatch) {
+				currentPhase = "finalizing"
+			}
+		}
+
+		return {
+			hasError,
+			errorMessage,
+			newlyDiscoveredWarnings,
+			newlyAnalyzedMods,
+			newlyDeployedMods,
+			currentPhase,
+			currentModName
+		}
+	}
+
 	function startDeployTimer(deployStartTime: number | null) {
 		if (timerWorker) {
 			timerWorker.terminate()
@@ -263,84 +340,14 @@
 		const parserWorkerCode = `
 			let currentPhase = "preparing";
 			let currentModName = "";
-			const errorPatterns = [/.*ERROR.*?\\t/, /Error:\\s*(.*)/, /uncaughtException/, /unhandledRejection/];
+			const parseLogs = ${parseLogs.toString()};
 
 			self.onmessage = (e) => {
 				const { newLines, existingWarnings } = e.data;
-				let hasError = false;
-				let errorMessage = "";
-				const newlyDiscoveredWarnings = [];
-				const newlyAnalyzedMods = [];
-				const newlyDeployedMods = [];
-
-				for (const line of newLines) {
-					const cleanLine = line.trim();
-					const stripped = cleanLine.replace(/[\\u001b\\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, "");
-
-					// 1. Error detection
-					for (const pattern of errorPatterns) {
-						if (line.match(pattern)) {
-							hasError = true;
-							errorMessage = line.replace(/.*(ERROR.*?\\t|Error:\\s*)/, "").trim();
-							break;
-						}
-					}
-
-					// 2. Warnings parsing
-					if (line.match(/.*WARN.*?\\t/)) {
-						const warning = line.replace(/.*WARN.*?\\t/, "").trim();
-						if (!existingWarnings.includes(warning) && !newlyDiscoveredWarnings.includes(warning)) {
-							newlyDiscoveredWarnings.push(warning);
-						}
-					}
-
-					// 3. Progress tracking
-					const discoveringMatch = stripped.match(/Discovering mod:\\s*(.*)/);
-					const analyzingMatch = stripped.match(/Analysing framework mod:\\s*(.*)/);
-					const stagingMatch = stripped.match(/Staging RPKG mod:\\s*(.*)/);
-					const deployingMatch = stripped.match(/Deploying\\s*(.*)/);
-					const writingMatch = stripped.match(/(Writing packagedefinition|Writing chunk|Generating ORES|Rebuilding)/);
-
-					if (discoveringMatch) {
-						currentPhase = "preparing";
-						currentModName = discoveringMatch[1].trim();
-					} else if (analyzingMatch) {
-						currentPhase = "analyzing";
-						const modName = analyzingMatch[1].trim();
-						newlyAnalyzedMods.push(modName);
-						currentModName = modName;
-					} else if (stagingMatch) {
-						currentPhase = "deploying";
-						const modName = stagingMatch[1].trim();
-						newlyDeployedMods.push(modName);
-						currentModName = modName;
-					} else if (deployingMatch) {
-						currentPhase = "deploying";
-						const modName = deployingMatch[1].trim();
-						newlyDeployedMods.push(modName);
-						currentModName = modName;
-					} else if (stripped.includes("Localising text")) {
-						currentPhase = "localising";
-					} else if (stripped.includes("Patching thumbs")) {
-						currentPhase = "patching-thumbs";
-					} else if (stripped.includes("Patching packagedefinition")) {
-						currentPhase = "patching-pd";
-					} else if (stripped.includes("Generating RPKGs")) {
-						currentPhase = "generating-rpkgs";
-					} else if (writingMatch) {
-						currentPhase = "finalizing";
-					}
-				}
-
-				self.postMessage({
-					hasError,
-					errorMessage,
-					newlyDiscoveredWarnings,
-					newlyAnalyzedMods,
-					newlyDeployedMods,
-					currentPhase,
-					currentModName
-				});
+				const result = parseLogs(newLines, existingWarnings, currentPhase, currentModName);
+				currentPhase = result.currentPhase;
+				currentModName = result.currentModName;
+				self.postMessage(result);
 			};
 		`
 		let parserWorkerUrl = ""
@@ -1222,65 +1229,38 @@
 	}
 
 	function parseLinesSynchronously(newLines: string[]) {
-		const errorPatterns = [/.*ERROR.*?\t/, /Error:\s*(.*)/, /uncaughtException/, /unhandledRejection/]
-		for (const line of newLines) {
-			const cleanLine = line.trim()
-			const stripped = cleanLine.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, "")
+		const result = parseLogs(newLines, deployWarnings, currentPhase, currentModName)
 
-			for (const pattern of errorPatterns) {
-				if (line.match(pattern)) {
-					hasError = true
-					errorMessage = line.replace(/.*(ERROR.*?\t|Error:\s*)/, "").trim()
-					break
-				}
-			}
-
-			if (line.match(/.*WARN.*?\t/)) {
-				const warning = line.replace(/.*WARN.*?\t/, "").trim()
-				if (!deployWarnings.includes(warning)) {
-					deployWarnings = [...deployWarnings, warning]
-				}
-			}
-
-			const discoveringMatch = stripped.match(/Discovering mod:\s*(.*)/)
-			const analyzingMatch = stripped.match(/Analysing framework mod:\s*(.*)/)
-			const stagingMatch = stripped.match(/Staging RPKG mod:\s*(.*)/)
-			const deployingMatch = stripped.match(/Deploying\s*(.*)/)
-			const writingMatch = stripped.match(/(Writing packagedefinition|Writing chunk|Generating ORES|Rebuilding)/)
-
-			if (discoveringMatch) {
-				currentPhase = "preparing"
-				currentModName = discoveringMatch[1].trim()
-			} else if (analyzingMatch) {
-				currentPhase = "analyzing"
-				const modName = analyzingMatch[1].trim()
-				analyzedMods.add(modName)
-				analyzedMods = analyzedMods
-				currentModName = modName
-			} else if (stagingMatch) {
-				currentPhase = "deploying"
-				const modName = stagingMatch[1].trim()
-				deployedMods.add(modName)
-				deployedMods = deployedMods
-				currentModName = modName
-			} else if (deployingMatch) {
-				currentPhase = "deploying"
-				const modName = deployingMatch[1].trim()
-				deployedMods.add(modName)
-				deployedMods = deployedMods
-				currentModName = modName
-			} else if (stripped.includes("Localising text")) {
-				currentPhase = "localising"
-			} else if (stripped.includes("Patching thumbs")) {
-				currentPhase = "patching-thumbs"
-			} else if (stripped.includes("Patching packagedefinition")) {
-				currentPhase = "patching-pd"
-			} else if (stripped.includes("Generating RPKGs")) {
-				currentPhase = "generating-rpkgs"
-			} else if (writingMatch) {
-				currentPhase = "finalizing"
-			}
+		if (result.hasError) {
+			hasError = true
+			errorMessage = result.errorMessage
 		}
+
+		if (result.newlyDiscoveredWarnings.length > 0) {
+			deployWarnings = [...deployWarnings, ...result.newlyDiscoveredWarnings]
+		}
+
+		if (result.newlyAnalyzedMods.length > 0) {
+			for (const mod of result.newlyAnalyzedMods) {
+				analyzedMods.add(mod)
+			}
+			analyzedMods = analyzedMods
+		}
+
+		if (result.newlyDeployedMods.length > 0) {
+			for (const mod of result.newlyDeployedMods) {
+				deployedMods.add(mod)
+			}
+			deployedMods = deployedMods
+		}
+
+		if (result.currentPhase === "generating-rpkgs" && currentPhase !== "generating-rpkgs") {
+			rpkgStartTime = performance.now()
+		}
+
+		currentPhase = result.currentPhase
+		currentModName = result.currentModName
+
 		updateProgressAndLabels()
 	}
 
@@ -1489,7 +1469,18 @@
 		<p>The framework couldn't sort your mods! Ask the developer of whichever mod you most recently installed to investigate this. Also, report this to Atampy26 on Hitman Forum or Discord.</p>
 	</Modal>
 
-	<Modal passiveModal bind:open={frameworkDeployModalOpen} modalHeading="Applying your mods" preventCloseOnClickOutside={!deployFinished}>
+	<Modal
+		passiveModal
+		bind:open={frameworkDeployModalOpen}
+		modalHeading="Applying your mods"
+		preventCloseOnClickOutside={!deployFinished}
+		on:close={(e) => {
+			if (!deployFinished) {
+				e.preventDefault()
+				frameworkDeployModalOpen = true
+			}
+		}}
+	>
 		{#if hasError}
 			<div class="mb-4">
 				<InlineNotification hideCloseButton lowContrast kind="error" title="Deployment Failed" subtitle={errorMessage} style="max-width: none; width: 100%;" />

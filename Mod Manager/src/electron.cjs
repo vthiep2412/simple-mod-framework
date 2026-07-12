@@ -160,7 +160,7 @@ if (!lock) {
 
 const fsPromises = fs.promises
 
-// skipcq: JS-R1005
+// skipcq: JS-0067, JS-R1005
 async function getJsonFilesAsync(dir, visited = new Set()) {
 	const results = []
 	try {
