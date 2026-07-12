@@ -26,7 +26,7 @@ let worker: Worker | null = null
 let currentWorkerId = 0
 const pendingResolvers = new Map<number, (res: [boolean, string]) => void>()
 
-// skipcq: JS-0045
+// skipcq: JS-0067
 function getWorker(): Worker {
 	if (!worker) {
 		worker = new ValidationWorker()
@@ -51,7 +51,7 @@ function getWorker(): Worker {
 	return worker
 }
 
-// skipcq: JS-0045
+// skipcq: JS-0067
 function validateInWorker(
 	modFolder: string,
 	manifest: unknown,
@@ -426,6 +426,7 @@ export function getCacheLoadStartCaller() {
 let cacheGeneration = 0
 let cacheLoadingPromise: Promise<void> | null = null
 
+// skipcq: JS-0067
 export function preloadModsCache(caller?: string, force = false): Promise<void> {
 	if (modsCacheInitialized && !force) {
 		return Promise.resolve()
@@ -439,6 +440,7 @@ export function preloadModsCache(caller?: string, force = false): Promise<void> 
 
 	const currentGeneration = ++cacheGeneration
 
+	// skipcq: JS-R1005
 	cacheLoadingPromise = (async () => {
 		try {
 			const modsDir = window.path.join("..", "Mods")
@@ -460,7 +462,7 @@ export function preloadModsCache(caller?: string, force = false): Promise<void> 
 			const tempManifestsMap = new Map<string, Manifest>()
 			const tempFoldersMap = new Map<string, string>()
 			const tempIsFrameworkMap = new Map<string, boolean>()
-			const validationPromises: Promise<any>[] = []
+			const validationPromises: Promise<unknown>[] = []
 
 			for (const subdir of subdirs) {
 				if (subdir === "Managed by SMF, do not touch") {
@@ -735,7 +737,7 @@ export function clearValidationCacheForFolder(modFolder: string) {
 
 let validationQueue = Promise.resolve()
 
-// skipcq: JS-0045
+// skipcq: JS-0067
 export async function validateModFolder(modFolder: string): Promise<[boolean, string]> {
 	if (validationCache.has(modFolder)) {
 		return validationCache.get(modFolder)!

@@ -9,20 +9,22 @@
 	import { goto } from "$app/navigation"
 
 	let cacheLoaded = false
-	let showBuildingCache = false
+	let cacheLoadError = ""
 
-	onMount(async () => {
-		const timer = setTimeout(() => {
-			showBuildingCache = true
-		}, 1500)
+	async function preloadCache() {
+		cacheLoaded = false
+		cacheLoadError = ""
 		try {
 			await preloadModsCache("authoring")
-		} catch (err) {
-			console.error("Failed to load mods cache for authoring:", err)
-		} finally {
-			clearTimeout(timer)
 			cacheLoaded = true
+		} catch (err: any) {
+			console.error("Failed to load mods cache for authoring:", err)
+			cacheLoadError = err?.message || "Failed to load mods cache."
 		}
+	}
+
+	onMount(() => {
+		preloadCache()
 	})
 </script>
 
@@ -37,7 +39,7 @@
 <br />
 
 {#if !cacheLoaded}
-	<CacheLoading {showBuildingCache} mt8={true} />
+	<CacheLoading loading={!cacheLoaded} error={cacheLoadError} retryCallback={preloadCache} mt8={true} />
 {:else}
 	<div class="mt-4 {window.screen.height <= 1080 ? 'h-[82vh]' : 'h-[85vh]'} pr-4 overflow-y-auto">
 		<div class="flex flex-wrap gap-4">

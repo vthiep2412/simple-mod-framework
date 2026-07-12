@@ -83,24 +83,26 @@
 	let enabledMods: { value: string }[] = []
 	let disabledMods: { value: string }[] = []
 	let cacheLoaded = false
-	let showBuildingCache = false
+	let cacheLoadError = ""
 	let deleteModModalOpen = false
 	let deleteModInProgress: string
 	let forceModListsUpdate = Math.random()
 
-	onMount(async () => {
-		const timer = setTimeout(() => {
-			showBuildingCache = true
-		}, 1500)
+	async function preloadCache() {
+		cacheLoaded = false
+		cacheLoadError = ""
 		try {
 			await preloadModsCache("modList")
-		} catch (e) {
-			console.error("Failed to preload mods cache on mount:", e)
-		} finally {
-			clearTimeout(timer)
 			cacheLoaded = true
 			window.ipc.send("checkDeployStatus")
+		} catch (e: any) {
+			console.error("Failed to preload mods cache on mount:", e)
+			cacheLoadError = e?.message || "Failed to load mods cache."
 		}
+	}
+
+	onMount(() => {
+		preloadCache()
 	})
 
 	$: if (cacheLoaded) {
@@ -246,10 +248,17 @@
 				}
 			};
 		`
-		const blob = new Blob([workerCode], { type: "application/javascript" })
-		const timerWorkerUrl = URL.createObjectURL(blob)
-		timerWorker = new Worker(timerWorkerUrl)
-		URL.revokeObjectURL(timerWorkerUrl)
+		let timerWorkerUrl = ""
+		try {
+			const blob = new Blob([workerCode], { type: "application/javascript" })
+			timerWorkerUrl = URL.createObjectURL(blob)
+			timerWorker = new Worker(timerWorkerUrl)
+		} catch (err) {
+			console.error("Failed to construct timerWorker:", err)
+			timerWorker = null
+		} finally {
+			if (timerWorkerUrl) URL.revokeObjectURL(timerWorkerUrl)
+		}
 
 		const parserWorkerCode = `
 			let currentPhase = "preparing";
@@ -334,10 +343,17 @@
 				});
 			};
 		`
-		const parserBlob = new Blob([parserWorkerCode], { type: "application/javascript" })
-		const parserWorkerUrl = URL.createObjectURL(parserBlob)
-		parserWorker = new Worker(parserWorkerUrl)
-		URL.revokeObjectURL(parserWorkerUrl)
+		let parserWorkerUrl = ""
+		try {
+			const parserBlob = new Blob([parserWorkerCode], { type: "application/javascript" })
+			parserWorkerUrl = URL.createObjectURL(parserBlob)
+			parserWorker = new Worker(parserWorkerUrl)
+		} catch (err) {
+			console.error("Failed to construct parserWorker:", err)
+			parserWorker = null
+		} finally {
+			if (parserWorkerUrl) URL.revokeObjectURL(parserWorkerUrl)
+		}
 
 		const updateTimer = () => {
 			const elapsedMs = performance.now() - startPerformanceTime
@@ -349,58 +365,87 @@
 
 		updateTimer()
 
-		timerWorker.onmessage = (e) => {
-			if (e.data === "tick") {
+		if (timerWorker) {
+			timerWorker.onmessage = (e) => {
+				if (e.data === "tick") {
+					updateTimer()
+					updateProgressAndLabels()
+				}
+			}
+			timerWorker.onerror = (error) => {
+				console.error("timerWorker runtime error:", error)
+				if (timerWorker) {
+					timerWorker.terminate()
+					timerWorker = null
+				}
+				clearInterval(deployTimerInterval)
+				deployTimerInterval = setInterval(() => {
+					updateTimer()
+					updateProgressAndLabels()
+				}, 1000)
+			}
+			timerWorker.postMessage("start")
+		} else {
+			clearInterval(deployTimerInterval)
+			deployTimerInterval = setInterval(() => {
 				updateTimer()
 				updateProgressAndLabels()
-			}
+			}, 1000)
 		}
 
-		parserWorker.onmessage = (e) => {
-			const {
-				hasError: workerHasError,
-				errorMessage: workerErrorMessage,
-				newlyDiscoveredWarnings,
-				newlyAnalyzedMods,
-				newlyDeployedMods,
-				currentPhase: workerCurrentPhase,
-				currentModName: workerCurrentModName
-			} = e.data
+		if (parserWorker) {
+			parserWorker.onmessage = (e) => {
+				const {
+					hasError: workerHasError,
+					errorMessage: workerErrorMessage,
+					newlyDiscoveredWarnings,
+					newlyAnalyzedMods,
+					newlyDeployedMods,
+					currentPhase: workerCurrentPhase,
+					currentModName: workerCurrentModName
+				} = e.data
 
-			if (workerHasError) {
-				hasError = true
-				errorMessage = workerErrorMessage
-			}
-
-			if (newlyDiscoveredWarnings.length > 0) {
-				deployWarnings = [...deployWarnings, ...newlyDiscoveredWarnings]
-			}
-
-			if (newlyAnalyzedMods.length > 0) {
-				for (const mod of newlyAnalyzedMods) {
-					analyzedMods.add(mod)
+				if (workerHasError) {
+					hasError = true
+					errorMessage = workerErrorMessage
 				}
-				analyzedMods = analyzedMods
-			}
 
-			if (newlyDeployedMods.length > 0) {
-				for (const mod of newlyDeployedMods) {
-					deployedMods.add(mod)
+				if (newlyDiscoveredWarnings.length > 0) {
+					deployWarnings = [...deployWarnings, ...newlyDiscoveredWarnings]
 				}
-				deployedMods = deployedMods
+
+				if (newlyAnalyzedMods.length > 0) {
+					for (const mod of newlyAnalyzedMods) {
+						analyzedMods.add(mod)
+					}
+					analyzedMods = analyzedMods
+				}
+
+				if (newlyDeployedMods.length > 0) {
+					for (const mod of newlyDeployedMods) {
+						deployedMods.add(mod)
+					}
+					deployedMods = deployedMods
+				}
+
+				if (workerCurrentPhase === "generating-rpkgs" && currentPhase !== "generating-rpkgs") {
+					rpkgStartTime = performance.now()
+				}
+
+				currentPhase = workerCurrentPhase
+				currentModName = workerCurrentModName
+
+				updateProgressAndLabels()
 			}
-
-			if (workerCurrentPhase === "generating-rpkgs" && currentPhase !== "generating-rpkgs") {
-				rpkgStartTime = performance.now()
+			parserWorker.onerror = (error) => {
+				console.error("parserWorker runtime error:", error)
+				if (parserWorker) {
+					parserWorker.terminate()
+					parserWorker = null
+				}
+				convertOutputToHTML()
 			}
-
-			currentPhase = workerCurrentPhase
-			currentModName = workerCurrentModName
-
-			updateProgressAndLabels()
 		}
-
-		timerWorker.postMessage("start")
 	}
 
 	function stopDeployTimer() {
@@ -1253,7 +1298,7 @@
 <svelte:window on:keydown={handleKeydown} />
 
 {#if !cacheLoaded}
-	<CacheLoading {showBuildingCache} />
+	<CacheLoading loading={!cacheLoaded} error={cacheLoadError} retryCallback={preloadCache} />
 {:else}
 	<div class="grid grid-cols-2 gap-4 w-full mb-16">
 		<div class="w-full">
@@ -1405,7 +1450,10 @@
 			try {
 				const modFolder = getModFolder(deleteModInProgress)
 				await removeDirectoryRecursive(modFolder)
-				mergeConfig({ knownMods: getConfig().knownMods.filter((a) => a != deleteModInProgress) })
+				mergeConfig({
+					knownMods: getConfig().knownMods.filter((a) => a != deleteModInProgress),
+					loadOrder: getConfig().loadOrder.filter((a) => a != deleteModInProgress)
+				})
 				clearValidationCacheForFolder(modFolder)
 
 				deleteModModalOpen = false
