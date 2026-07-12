@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { scale, fade } from "svelte/transition"
 	import { flip } from "svelte/animate"
-	import { onMount, tick } from "svelte"
+	import { onMount, tick, onDestroy } from "svelte"
 
 	import json5 from "json5"
 	import { Button, CodeSnippet, InlineNotification, Modal, ProgressBar, Search, Loading } from "carbon-components-svelte"
@@ -54,7 +54,7 @@
 	} from "$lib/utils"
 	import Mod from "$lib/Mod.svelte"
 	import TextInputModal from "$lib/TextInputModal.svelte"
-	import { goto } from "$app/navigation"
+	import { goto, beforeNavigate } from "$app/navigation"
 
 	import AddIcon from "carbon-icons-svelte/lib/Add.svelte"
 	import AddAltIcon from "carbon-icons-svelte/lib/AddAlt.svelte"
@@ -78,6 +78,7 @@
 	import { OptionType } from "../../../../src/types"
 	import { page } from "$app/stores"
 	import SortableList from "$lib/SortableList.svelte"
+	import CacheLoading from "$lib/CacheLoading.svelte"
 
 	let enabledMods: { value: string }[] = []
 	let disabledMods: { value: string }[] = []
@@ -246,7 +247,9 @@
 			};
 		`
 		const blob = new Blob([workerCode], { type: "application/javascript" })
-		timerWorker = new Worker(URL.createObjectURL(blob))
+		const timerWorkerUrl = URL.createObjectURL(blob)
+		timerWorker = new Worker(timerWorkerUrl)
+		URL.revokeObjectURL(timerWorkerUrl)
 
 		const parserWorkerCode = `
 			let currentPhase = "preparing";
@@ -332,7 +335,9 @@
 			};
 		`
 		const parserBlob = new Blob([parserWorkerCode], { type: "application/javascript" })
-		parserWorker = new Worker(URL.createObjectURL(parserBlob))
+		const parserWorkerUrl = URL.createObjectURL(parserBlob)
+		parserWorker = new Worker(parserWorkerUrl)
+		URL.revokeObjectURL(parserWorkerUrl)
 
 		const updateTimer = () => {
 			const elapsedMs = performance.now() - startPerformanceTime
@@ -365,7 +370,6 @@
 			if (workerHasError) {
 				hasError = true
 				errorMessage = workerErrorMessage
-				stopDeployTimer()
 			}
 
 			if (newlyDiscoveredWarnings.length > 0) {
@@ -575,7 +579,9 @@
 
 		if (newLines.length > 0) {
 			totalLinesCount += newLines.length
-			if (parserWorker) {
+			if (deployFinished || hasError || !parserWorker) {
+				parseLinesSynchronously(newLines)
+			} else {
 				parserWorker.postMessage({ newLines, existingWarnings: deployWarnings })
 			}
 		}
@@ -597,9 +603,8 @@
 
 	window.ipc.receive("frameworkDeployFinished", () => {
 		deployFinished = true
-		stopDeployTimer()
-		convertOutputToHTML()
 		convertOutputToHTML.flush()
+		stopDeployTimer()
 
 		const lines = deployOutput.split(/\r?\n/).map((a) => a.trim())
 		const succeeded = lines.some((a) => a.includes("Done in"))
@@ -1170,17 +1175,85 @@
 		forceModListsUpdate = Math.random()
 		markChanged()
 	}
+
+	function parseLinesSynchronously(newLines: string[]) {
+		const errorPatterns = [/.*ERROR.*?\t/, /Error:\s*(.*)/, /uncaughtException/, /unhandledRejection/]
+		for (const line of newLines) {
+			const cleanLine = line.trim()
+			const stripped = cleanLine.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, "")
+
+			for (const pattern of errorPatterns) {
+				if (line.match(pattern)) {
+					hasError = true
+					errorMessage = line.replace(/.*(ERROR.*?\t|Error:\s*)/, "").trim()
+					break
+				}
+			}
+
+			if (line.match(/.*WARN.*?\t/)) {
+				const warning = line.replace(/.*WARN.*?\t/, "").trim()
+				if (!deployWarnings.includes(warning)) {
+					deployWarnings = [...deployWarnings, warning]
+				}
+			}
+
+			const discoveringMatch = stripped.match(/Discovering mod:\s*(.*)/)
+			const analyzingMatch = stripped.match(/Analysing framework mod:\s*(.*)/)
+			const stagingMatch = stripped.match(/Staging RPKG mod:\s*(.*)/)
+			const deployingMatch = stripped.match(/Deploying\s*(.*)/)
+			const writingMatch = stripped.match(/(Writing packagedefinition|Writing chunk|Generating ORES|Rebuilding)/)
+
+			if (discoveringMatch) {
+				currentPhase = "preparing"
+				currentModName = discoveringMatch[1].trim()
+			} else if (analyzingMatch) {
+				currentPhase = "analyzing"
+				const modName = analyzingMatch[1].trim()
+				analyzedMods.add(modName)
+				analyzedMods = analyzedMods
+				currentModName = modName
+			} else if (stagingMatch) {
+				currentPhase = "deploying"
+				const modName = stagingMatch[1].trim()
+				deployedMods.add(modName)
+				deployedMods = deployedMods
+				currentModName = modName
+			} else if (deployingMatch) {
+				currentPhase = "deploying"
+				const modName = deployingMatch[1].trim()
+				deployedMods.add(modName)
+				deployedMods = deployedMods
+				currentModName = modName
+			} else if (stripped.includes("Localising text")) {
+				currentPhase = "localising"
+			} else if (stripped.includes("Patching thumbs")) {
+				currentPhase = "patching-thumbs"
+			} else if (stripped.includes("Patching packagedefinition")) {
+				currentPhase = "patching-pd"
+			} else if (stripped.includes("Generating RPKGs")) {
+				currentPhase = "generating-rpkgs"
+			} else if (writingMatch) {
+				currentPhase = "finalizing"
+			}
+		}
+		updateProgressAndLabels()
+	}
+
+	onDestroy(() => {
+		stopDeployTimer()
+	})
+
+	beforeNavigate((navigation) => {
+		if (frameworkDeployModalOpen && !deployFinished) {
+			navigation.cancel()
+		}
+	})
 </script>
 
 <svelte:window on:keydown={handleKeydown} />
 
 {#if !cacheLoaded}
-	<div class="flex flex-col items-center justify-center h-[80vh] w-full gap-4">
-		<Loading withOverlay={false} />
-		<span class="text-gray-400 text-sm">
-			{showBuildingCache ? "Building cache..." : "Loading mods cache..."}
-		</span>
-	</div>
+	<CacheLoading {showBuildingCache} />
 {:else}
 	<div class="grid grid-cols-2 gap-4 w-full mb-16">
 		<div class="w-full">
@@ -1368,7 +1441,7 @@
 		<p>The framework couldn't sort your mods! Ask the developer of whichever mod you most recently installed to investigate this. Also, report this to Atampy26 on Hitman Forum or Discord.</p>
 	</Modal>
 
-	<Modal passiveModal bind:open={frameworkDeployModalOpen} modalHeading="Applying your mods" preventCloseOnClickOutside={!deployFinished && !hasError}>
+	<Modal passiveModal bind:open={frameworkDeployModalOpen} modalHeading="Applying your mods" preventCloseOnClickOutside={!deployFinished}>
 		{#if hasError}
 			<div class="mb-4">
 				<InlineNotification hideCloseButton lowContrast kind="error" title="Deployment Failed" subtitle={errorMessage} style="max-width: none; width: 100%;" />
@@ -1425,7 +1498,7 @@
 			{/if}
 		</div>
 
-		{#if deployFinished || hasError}
+		{#if deployFinished}
 			<br />
 			<div class="flex gap-4 items-center">
 				{#if deployOutput

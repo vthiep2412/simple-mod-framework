@@ -28,7 +28,7 @@ function performValidation(modFolder, manifest, contentFoldersStatus = {}, jsonF
 
 	const contentDirs = [
 		...(manifest.contentFolders || []),
-		...(manifest.options || []).flatMap((a) => a.contentFolders || [])
+		...(manifest.options || []).flatMap((a) => a?.contentFolders || [])
 	]
 	for (const contentFolder of contentDirs) {
 		if (!contentFoldersStatus[contentFolder]) {
@@ -45,11 +45,11 @@ function performValidation(modFolder, manifest, contentFoldersStatus = {}, jsonF
 		}
 
 		if (file.endsWith("entity.json")) {
-			if (!validateEntity(parsed)) {
+			if (parsed?.quickEntityVersion === 3.1 && !validateEntity(parsed)) {
 				return [false, `Invalid entity "${file}" due to non-matching schema: ${ajvInstance.errorsText(validateEntity.errors)}`]
 			}
 		} else if (file.endsWith("entity.patch.json")) {
-			if (!validateEntityPatch(parsed)) {
+			if (parsed?.patchVersion === 6 && !validateEntityPatch(parsed)) {
 				return [false, `Invalid entity patch "${file}" due to non-matching schema: ${ajvInstance.errorsText(validateEntityPatch.errors)}`]
 			}
 		} else if (file.endsWith("repository.json")) {

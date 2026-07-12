@@ -19,13 +19,14 @@ const manifestsMap = new Map<string, Manifest>()
 const foldersMap = new Map<string, string>()
 const isFrameworkMap = new Map<string, boolean>()
 
-// @ts-expect-error Vite worker query type definitions
+// skipcq: JS-C1003
 import ValidationWorker from "./validation.worker?worker"
 
 let worker: Worker | null = null
 let currentWorkerId = 0
 const pendingResolvers = new Map<number, (res: [boolean, string]) => void>()
 
+// skipcq: JS-0045
 function getWorker(): Worker {
 	if (!worker) {
 		worker = new ValidationWorker()
@@ -43,14 +44,17 @@ function getWorker(): Worker {
 				resolver([false, "Validation worker crashed"])
 				pendingResolvers.delete(id)
 			}
+			worker?.terminate()
+			worker = null
 		}
 	}
 	return worker
 }
 
+// skipcq: JS-0045
 function validateInWorker(
 	modFolder: string,
-	manifest: any,
+	manifest: unknown,
 	contentFoldersStatus: Record<string, boolean>,
 	jsonFilesData: Record<string, string>
 ): Promise<[boolean, string]> {
@@ -456,6 +460,7 @@ export function preloadModsCache(caller?: string, force = false): Promise<void> 
 			const tempManifestsMap = new Map<string, Manifest>()
 			const tempFoldersMap = new Map<string, string>()
 			const tempIsFrameworkMap = new Map<string, boolean>()
+			const validationPromises: Promise<any>[] = []
 
 			for (const subdir of subdirs) {
 				if (subdir === "Managed by SMF, do not touch") {
@@ -500,14 +505,14 @@ export function preloadModsCache(caller?: string, force = false): Promise<void> 
 					tempIsFrameworkMap.set(id, false)
 				}
 
-				try {
-					await validateModFolder(fullPath)
-				} catch (e) {
-					console.error(`Validation failed for subdir: ${subdir}`, e)
-				}
-
-				await new Promise((resolve) => setTimeout(resolve, 0))
+				validationPromises.push(
+					validateModFolder(fullPath).catch((e) => {
+						console.error(`Validation failed for subdir: ${subdir}`, e)
+					})
+				)
 			}
+
+			await Promise.all(validationPromises)
 
 			if (currentGeneration !== cacheGeneration) {
 				await cacheLoadingPromise
@@ -730,7 +735,12 @@ export function clearValidationCacheForFolder(modFolder: string) {
 
 let validationQueue = Promise.resolve()
 
-async function runValidationAsync(modFolder: string): Promise<[boolean, string]> {
+// skipcq: JS-0045
+export async function validateModFolder(modFolder: string): Promise<[boolean, string]> {
+	if (validationCache.has(modFolder)) {
+		return validationCache.get(modFolder)!
+	}
+
 	try {
 		const manifestPath = window.path.join(modFolder, "manifest.json")
 		const { statsParts, manifest, contentFoldersStatus, jsonFilesData } = await window.ipc.invoke("get-mod-stats", modFolder)
@@ -743,45 +753,36 @@ async function runValidationAsync(modFolder: string): Promise<[boolean, string]>
 			return result
 		}
 
-		// Validate in Web Worker background thread
-		const result = await validateInWorker(modFolder, manifest, contentFoldersStatus, jsonFilesData)
-		validationCache.set(modFolder, result)
-
-		// Evict older cache entries for this mod to prevent orphaned keys
-		const prefix = `val-cache:${manifestPath}`
-		for (let i = localStorage.length - 1; i >= 0; i--) {
-			const key = localStorage.key(i)
-			if (key?.startsWith(prefix)) {
-				localStorage.removeItem(key)
+		const promise = validationQueue.then(async () => {
+			if (validationCache.has(modFolder)) {
+				return validationCache.get(modFolder)!
 			}
-		}
 
-		localStorage.setItem(cacheKey, JSON.stringify(result))
-		return result
+			const result = await validateInWorker(modFolder, manifest, contentFoldersStatus, jsonFilesData)
+			if (result[1] !== "Validation worker crashed") {
+				validationCache.set(modFolder, result)
+
+				const prefix = `val-cache:${manifestPath}`
+				for (let i = localStorage.length - 1; i >= 0; i--) {
+					const key = localStorage.key(i)
+					if (key?.startsWith(prefix)) {
+						localStorage.removeItem(key)
+					}
+				}
+
+				localStorage.setItem(cacheKey, JSON.stringify(result))
+			}
+			return result
+		})
+
+		validationQueue = promise.then(() => {}).catch(() => {})
+
+		return promise
 	} catch {
 		const result: [boolean, string] = [false, "Validation crashed"]
 		validationCache.set(modFolder, result)
 		return result
 	}
-}
-
-export function validateModFolder(modFolder: string): Promise<[boolean, string]> {
-	if (validationCache.has(modFolder)) {
-		return Promise.resolve(validationCache.get(modFolder)!)
-	}
-
-	const promise = validationQueue.then(async () => {
-		// In case it was validated while waiting in queue
-		if (validationCache.has(modFolder)) {
-			return validationCache.get(modFolder)!
-		}
-		return runValidationAsync(modFolder)
-	})
-
-	// Advance the queue
-	validationQueue = promise.then(() => {}).catch(() => {})
-
-	return promise
 }
 
 export async function removeDirectoryRecursive(dirPath: string) {

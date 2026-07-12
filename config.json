@@ -1,1 +1,8 @@
-{runtimePath:'C:\\Users\\User\\Documents\\Apps\\Games\\Epic Games\\HITMAN3\\Runtime',skipIntro:true,outputToSeparateDirectory:true,loadOrder:[],modOptions:{},outputConfigToAppDataOnDeploy:true,knownMods:['Atampy26.EnhancedCameraZoom','Atampy26.HackableEverything','Atampy26.LockableDoors','Atampy26.ReusablePoisons','BSh.PistolDoors','Bryn.Halloween','Bryn.SafehouseVisitors','Bryn.TidySuits','BurnTheWitch.HeritageUI','Charc0al.NoHoldButtons','Charc0al.RealisticSnipers','Dreant.BulletproofSuit','baldilocks47.evgoldballer_fix','KevinRudd.FreelancerVariations','GlacierOrganisation.CommunityPatches','LtOmG.H3SigSuitsTiesUP','enept.MagazineCountConfigurator','Notex.KeyboardKeypadInput','Notex.SimpleHealthBar','Notex.SimpleKeyEventHelper','Duckilous.NumberedBarcode','BurnTheWitch.PureInstinct','Atampy26.ReadableUI','musicalmushr00m.bangkok-recorder','Lanox31.Reusable_Syringes','KevinRudd.SandboxHantu','KevinRudd.SandboxVector','TeamRuddcy.RealYacht','Tele.RavenHunterHat','Tumbler.CameraUpgrades','Tumbler.everclear','Atampy26.WallPiercingJaeger7Lancer','chazza.loadout_lite','muddye.LegacyAgencyPickups','musicalmushr00m.LightingUltimate','riisikumi.syringes','thepeacockproject.peacockstrings','voodoohillbilly.h3-stocked-up-safehouse'],developerMode:false,retailPath:'..\\Retail',reportErrors:false,errorReportingID:'e912161a-2cb8-4ad2-a619-e6eab2cd00b3'}
+{
+    runtimePath: 'C:\\Users\\User\\Documents\\Apps\\Games\\Epic Games\\HITMAN3\\Runtime',
+    skipIntro: true,
+    outputToSeparateDirectory: true,
+    loadOrder: [],
+    modOptions: {},
+    outputConfigToAppDataOnDeploy: true
+}

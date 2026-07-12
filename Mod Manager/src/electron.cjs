@@ -4,8 +4,11 @@ const { app, BrowserWindow, ipcMain, dialog } = require("electron")
 const serve = require("electron-serve")
 // skipcq: JS-0359
 const { spawn, execSync } = require("child_process")
+// skipcq: JS-0359
 const fs = require("fs")
+// skipcq: JS-0359
 const path = require("path")
+// skipcq: JS-0359
 const json5 = require("json5")
 
 try {
@@ -25,7 +28,7 @@ const dev = !app.isPackaged
 /** @type BrowserWindow */
 let mainWindow
 const sendToWindow = (channel, ...args) => {
-	if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents) {
+	if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents && !mainWindow.webContents.isDestroyed()) {
 		mainWindow.webContents.send(channel, ...args)
 	}
 }
@@ -157,8 +160,9 @@ if (!lock) {
 
 const fsPromises = fs.promises
 
+// skipcq: JS-R1005
 async function getJsonFilesAsync(dir, visited = new Set()) {
-	let results = []
+	const results = []
 	try {
 		const realDir = await fsPromises.realpath(dir)
 		if (visited.has(realDir)) return results
@@ -184,6 +188,7 @@ async function getJsonFilesAsync(dir, visited = new Set()) {
 	return results
 }
 
+// skipcq: JS-R1005
 ipcMain.handle("get-mod-stats", async (event, modFolder) => {
 	try {
 		const manifestPath = path.join(modFolder, "manifest.json")
@@ -211,7 +216,12 @@ ipcMain.handle("get-mod-stats", async (event, modFolder) => {
 				...(manifest.options || []).flatMap((opt) => opt.contentFolders || [])
 			]
 			for (const dir of contentDirs) {
+				if (!dir) continue
 				const fullPath = path.resolve(modFolder, dir)
+				const relative = path.relative(modFolder, fullPath)
+				if (relative.startsWith("..") || path.isAbsolute(relative)) {
+					continue
+				}
 				try {
 					await fsPromises.access(fullPath)
 					contentFoldersStatus[dir] = true
@@ -226,7 +236,12 @@ ipcMain.handle("get-mod-stats", async (event, modFolder) => {
 				...(manifest.options || []).flatMap((opt) => opt.blobsFolders || [])
 			]
 			for (const dir of blobsDirs) {
+				if (!dir) continue
 				const fullPath = path.resolve(modFolder, dir)
+				const relative = path.relative(modFolder, fullPath)
+				if (relative.startsWith("..") || path.isAbsolute(relative)) {
+					continue
+				}
 				try {
 					await fsPromises.access(fullPath)
 					filesToStat.push(fullPath)

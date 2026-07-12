@@ -2,7 +2,8 @@
 	import { scale } from "svelte/transition"
 	import { onMount } from "svelte"
 
-	import { Button, Tile, Truncate, Loading } from "carbon-components-svelte"
+	import { Button, Tile, Truncate } from "carbon-components-svelte"
+	import CacheLoading from "$lib/CacheLoading.svelte"
 	import { getAllMods, getManifestFromModID, modIsFramework, preloadModsCache } from "$lib/utils"
 	import Edit from "carbon-icons-svelte/lib/Edit.svelte"
 	import { goto } from "$app/navigation"
@@ -36,12 +37,7 @@
 <br />
 
 {#if !cacheLoaded}
-	<div class="flex flex-col items-center justify-center h-[80vh] w-full gap-4 mt-8">
-		<Loading withOverlay={false} />
-		<span class="text-gray-400 text-sm">
-			{showBuildingCache ? "Building cache..." : "Loading mods cache..."}
-		</span>
-	</div>
+	<CacheLoading {showBuildingCache} mt8={true} />
 {:else}
 	<div class="mt-4 {window.screen.height <= 1080 ? 'h-[82vh]' : 'h-[85vh]'} pr-4 overflow-y-auto">
 		<div class="flex flex-wrap gap-4">
