@@ -19,7 +19,7 @@ const manifestsMap = new Map<string, Manifest>()
 const foldersMap = new Map<string, string>()
 const isFrameworkMap = new Map<string, boolean>()
 
-// skipcq: JS-C1003
+// skipcq: JS-C1003, JS-W1028
 import ValidationWorker from "./validation.worker?worker"
 
 let worker: Worker | null = null
